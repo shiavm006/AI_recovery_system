@@ -1,0 +1,25 @@
+# Nakad — payment recovery project rules
+
+## Runtime and typing
+
+- Python 3.11.
+- Pydantic v2 only — never v1 syntax. Use `field_validator`, `model_validator`, and `ConfigDict`.
+- Every function must have type hints.
+
+## Money
+
+- All money is integer **paise**. Never use `float` or `Decimal` for amounts.
+
+## Shared types
+
+- All shared types live in `models.py`.
+- Import them from `models.py` — never redefine locally.
+
+## Style
+
+- Prefer small pure functions over classes.
+- Do not add dependencies without asking first.
+
+## Documentation
+
+When working with chainladder, Pydantic, Razorpay webhooks, Razorpay subscriptions, or Streamlit, fetch current documentation rather than relying on memory.
