@@ -6,11 +6,11 @@ import numpy as np
 import pandas as pd
 import chainladder as cl
 
-# Pin the valuation month so the run is reproducible regardless of clock.
+
 VALUATION_MONTH: pd.Timestamp = pd.Timestamp("2026-09-01")
 AMOUNT_PAISE: tuple[int, ...] = (14900, 29900, 49900, 99900)
 AMOUNT_WEIGHTS: tuple[float, ...] = (0.40, 0.35, 0.18, 0.07)
-# ponytail: lognormal lag is a shape heuristic (median ~42d, mass in 20–70, clip at 120).
+
 LAG_MU: float = float(np.log(42.0))
 LAG_SIGMA: float = 0.45
 

@@ -1,0 +1,33 @@
+# These are placeholders to be replaced with NPCI published per-bank decline data.
+- name: SBI
+  volume_share: 0.28
+  td_rate: 0.008
+  bd_rate: 0.055
+- name: HDFC
+  volume_share: 0.18
+  td_rate: 0.004
+  bd_rate: 0.052
+- name: ICICI
+  volume_share: 0.16
+  td_rate: 0.005
+  bd_rate: 0.058
+- name: Axis
+  volume_share: 0.12
+  td_rate: 0.007
+  bd_rate: 0.065
+- name: Kotak
+  volume_share: 0.08
+  td_rate: 0.003
+  bd_rate: 0.050
+- name: PNB
+  volume_share: 0.08
+  td_rate: 0.011
+  bd_rate: 0.078
+- name: Bank of Baroda
+  volume_share: 0.06
+  td_rate: 0.010
+  bd_rate: 0.072
+- name: Yes Bank
+  volume_share: 0.04
+  td_rate: 0.006
+  bd_rate: 0.080
