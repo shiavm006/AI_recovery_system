@@ -505,9 +505,9 @@ if __name__ == "__main__":
 
     print("\n  ledger verification")
     for result in results:
-        ok, bad_seq = Ledger(result.ledger_path).verify()
+        check = Ledger(result.ledger_path).verify()
         entries = len(Ledger(result.ledger_path).read_all())
-        detail = "intact" if ok else f"BROKEN at seq {bad_seq}"
+        detail = "intact" if check.ok else f"{check.failure.upper()} at seq {check.seq}"
         print(
             f"    {result.policy:<8} {entries:>5} entries "
             f"({entries // len(batch)} per event)  {detail}  {result.ledger_path}"

@@ -167,8 +167,8 @@ def test_every_event_gets_the_full_four_entry_trace(tmp_path):
             assert [entry.entry_type for entry in window] == list(TRACE_ENTRY_TYPES)
             assert {entry.event_id for entry in window} == {event.event_id}
 
-        ok, bad_seq = Ledger(str(path)).verify()
-        assert ok, f"{policy} ledger broken at seq {bad_seq}"
+        check = Ledger(str(path)).verify()
+        assert check.ok, f"{policy} ledger {check.failure} at seq {check.seq}"
 
 
 def test_blocked_actions_do_not_consume_budget(tmp_path):
