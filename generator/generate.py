@@ -116,9 +116,36 @@ def _signal(
     return options[int(rng.integers(len(options)))]
 
 
-def _true_cause(
-    rng: np.random.Generator, p_tech: float
-) -> RootCause:
+def _features(
+    rng: np.random.Generator, cause: RootCause
+) -> tuple[int, int, float, float]:
+    """Noisy correlates of true_cause. Overlap is intentional — no hard cutoff."""
+    days = float(rng.lognormal(np.log(45.0), 0.7))
+    if cause is RootCause.DEAD_MANDATE:
+        days += float(rng.uniform(60.0, 280.0))
+    days_i = int(np.clip(days, 1.0, 800.0))
+
+    if cause is RootCause.INSUFFICIENT_FUNDS:
+        day = int(rng.integers(24, 32) if rng.random() < 0.65 else rng.integers(1, 32))
+    else:
+        day = int(rng.integers(24, 32) if rng.random() < 0.15 else rng.integers(1, 32))
+    day = min(day, 31)
+
+    rate = float(rng.beta(2.0, 40.0))
+    if cause is RootCause.ISSUER_DOWNTIME:
+        rate += float(rng.uniform(0.08, 0.35))
+    elif rng.random() < 0.08:
+        rate += float(rng.uniform(0.05, 0.20))
+    rate = round(float(np.clip(rate, 0.0, 0.9)), 3)
+
+    ratio = float(rng.lognormal(0.0, 0.25))
+    if cause is RootCause.RISK_BLOCK:
+        ratio *= float(rng.uniform(1.4, 3.5))
+    ratio = round(float(np.clip(ratio, 0.2, 8.0)), 2)
+    return days_i, day, rate, ratio
+
+
+def _true_cause(rng: np.random.Generator, p_tech: float) -> RootCause:
     if rng.random() < 0.03:
         return RootCause.RISK_BLOCK
     if rng.random() < p_tech:
@@ -189,6 +216,7 @@ def generate_batch(n: int = 500, seed: int = 42) -> list[FailureEvent]:
             cause = _true_cause(rng, float(p_tech[bank_i]))
             code, source, step, reason = _signal(rng, cause, bool(ambiguous_mask[i]))
             occurred_at = ANCHOR - timedelta(seconds=float(offsets[i]))
+        days, day, rate, ratio = _features(rng, cause)
         events.append(
             FailureEvent(
                 event_id=_rzp_id(rng, "evt_"),
@@ -203,6 +231,10 @@ def generate_batch(n: int = 500, seed: int = 42) -> list[FailureEvent]:
                 error_reason=reason,
                 occurred_at=occurred_at,
                 retries_used=int(retries[i]),
+                days_since_mandate_created=days,
+                day_of_month=day,
+                issuer_recent_failure_rate=rate,
+                amount_vs_customer_avg=ratio,
                 true_cause=cause,
             )
         )

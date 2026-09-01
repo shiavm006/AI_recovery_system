@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class RootCause(str, Enum):
@@ -48,6 +48,10 @@ class FailureEvent(BaseModel):
     error_reason: str
     occurred_at: datetime
     retries_used: int = 0
+    days_since_mandate_created: int = Field(ge=0)
+    day_of_month: int = Field(ge=1, le=31)
+    issuer_recent_failure_rate: float = Field(ge=0.0, le=1.0)
+    amount_vs_customer_avg: float = Field(ge=0.0)
     true_cause: RootCause | None = None
 
     @field_validator("amount_paise")
