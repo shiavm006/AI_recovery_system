@@ -10,10 +10,19 @@ No LLM calls, no network calls.
 from __future__ import annotations
 
 from collections import Counter
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from models import ActionType, Diagnosis, FailureEvent, ProposedAction, RootCause
-from pipeline.govern import CONTACT_ACTIONS, RAIL_ACTIONS
+from pipeline.govern import (
+    CONTACT_ACTIONS,
+    CONTACT_WINDOW,
+    NPCI_RETRY_CAP,
+    PEAK_RAIL_WINDOWS,
+    RAIL_ACTIONS,
+    GateContext,
+    minute_of_day,
+    to_ist,
+)
 
 # Recovery probability per root cause, before context.
 #
@@ -55,9 +64,13 @@ DEFAULT_CONTACT_BUDGET = 60
 ATTEMPT_COST_UNITS = 1.0
 CONTACT_COST_UNITS = 0.25
 
-# Hours to wait after the failure before acting. INVENTED, except DEAD_MANDATE:
-# govern.py r02 requires a pre-debit notice at least 24 hours before a
-# re-presentation, so anything sooner would be blocked at the gate anyway.
+# The earliest we are willing to act, in hours after the failure. These are
+# floors, not the schedule: next_permitted_time pushes the action forward from
+# here to the first moment the gate's clock rules allow it.
+#
+# INVENTED, except DEAD_MANDATE: govern.py r02 requires a pre-debit notice at
+# least 24 hours before a re-presentation, so anything sooner would be blocked
+# at the gate anyway.
 ACTION_DELAY_HOURS: dict[RootCause, int] = {
     RootCause.NETWORK_TIMEOUT: 1,  # retry once the blip clears
     RootCause.ISSUER_DOWNTIME: 6,  # let the bank's outage window pass
@@ -87,6 +100,17 @@ MIN_ACTIONABLE_CONFIDENCE = 0.5
 SUPPRESSED_FOR_BUDGET = "excluded for budget"
 SUPPRESSED_FOR_LOW_VALUE = "excluded for low expected value"
 SUPPRESSED_FOR_LOW_CONFIDENCE = "excluded for low diagnostic confidence"
+SUPPRESSED_FOR_NO_HEADROOM = "excluded for no mandate headroom"
+SUPPRESSED_FOR_NO_WINDOW = "excluded for no permitted window"
+
+# How far past the earliest acceptable time the scheduler will hunt for a legal
+# window before giving up. An NPCI attempt belongs to the current mandate
+# cycle, so an action pushed more than three days out is not this cycle's
+# recovery any more. CHOSEN. With the current windows nothing comes close to
+# needing it — the longest wait is the overnight gap before contact hours — so
+# it is a guard against a future rule that closes a whole day, not a live
+# constraint.
+SCHEDULING_HORIZON_HOURS = 72
 
 # The two scarce pools. Mandate attempts are capped by NPCI; contacts are
 # capped by how often we are willing to bother one customer in a cycle.
@@ -96,6 +120,11 @@ CONTACT_POOL = "contact"
 
 def _near_payday(day_of_month: int) -> bool:
     return day_of_month in PAYDAY_DAYS
+
+
+def has_rail_headroom(event: FailureEvent) -> bool:
+    """Whether the mandate has an NPCI attempt left."""
+    return event.retries_used < NPCI_RETRY_CAP
 
 
 def _probability_terms(event: FailureEvent, diagnosis: Diagnosis) -> dict[str, float]:
@@ -126,15 +155,109 @@ def intervention_for(event: FailureEvent, diagnosis: Diagnosis) -> ActionType:
     A balance failure away from payday is the one exception: asking the
     customer costs a contact, where a retry would burn a scarce attempt on a
     balance that probably has not arrived yet.
+
+    A mandate already at the NPCI cap gets no rail action at all. govern r01
+    would refuse it, and an action the gate is certain to block still consumes
+    a budget unit here — paying for something that cannot happen.
     """
     if diagnosis.cause is RootCause.INSUFFICIENT_FUNDS and not _near_payday(
         event.day_of_month
     ):
         return ActionType.PAYMENT_LINK
-    return INTERVENTION_BY_CAUSE[diagnosis.cause]
+    action = INTERVENTION_BY_CAUSE[diagnosis.cause]
+    if action in RAIL_ACTIONS and not has_rail_headroom(event):
+        return ActionType.SUPPRESS
+    return action
 
 
-def _budget_pool(action: ActionType) -> str | None:
+def _blocking_window_ends_at(action: ActionType, when: datetime) -> datetime | None:
+    """When the window currently blocking ``action`` lifts, or None if it is open.
+
+    IST has no daylight saving, so adding minutes to a local time is the same
+    as adding them to the instant. This would need care in a zone that shifts.
+    """
+    local = to_ist(when)
+    minute = minute_of_day(local)
+    if action in RAIL_ACTIONS:
+        for start, end in PEAK_RAIL_WINDOWS:
+            if start <= minute < end:
+                return local + timedelta(minutes=end - minute)
+        return None
+    if action in CONTACT_ACTIONS:
+        start, end = CONTACT_WINDOW
+        if minute < start:
+            return local + timedelta(minutes=start - minute)
+        if minute >= end:
+            return local + timedelta(minutes=24 * 60 - minute + start)
+        return None
+    return None
+
+
+def next_permitted_time(
+    action: ActionType, earliest: datetime, ctx: GateContext
+) -> datetime | None:
+    """The first moment at or after ``earliest`` when the clock permits ``action``.
+
+    The gate is not a wall to walk into. Two of its rules depend only on the
+    time we pick — r01 freezes the rails inside ``PEAK_RAIL_WINDOWS``, r06
+    confines contact to ``CONTACT_WINDOW`` — so an action refused for either
+    reason was not forbidden, merely booked at the wrong hour. Both window
+    definitions are imported from govern rather than restated here; a second
+    copy of the boundaries is a copy that eventually disagrees with the rule
+    enforcing them.
+
+    Returns None when no window opens inside ``SCHEDULING_HORIZON_HOURS``, and
+    when ``ctx`` rules the action out for a reason no hour can fix: a mandate
+    at the NPCI cap is refused at every moment, so there is no time to find.
+    Callers must suppress rather than schedule in that case.
+    """
+    if action in RAIL_ACTIONS and ctx.retries_used >= NPCI_RETRY_CAP:
+        return None
+
+    deadline = earliest + timedelta(hours=SCHEDULING_HORIZON_HOURS)
+    when = earliest
+    while when <= deadline:
+        opens_at = _blocking_window_ends_at(action, when)
+        if opens_at is None:
+            return when
+        when = opens_at
+    return None
+
+
+def _schedule_context(event: FailureEvent, when: datetime) -> GateContext:
+    """The slice of GateContext the scheduler reads: the clock and the cap.
+
+    :func:`next_permitted_time` consults ``now`` and ``retries_used`` and
+    nothing else. The customer state in the remaining fields is not known at
+    allocation time — run.py assembles the real context at the gate — so they
+    are set to values that cannot change the answer. If a clock-dependent rule
+    ever starts reading one of them, this stops being safe and the scheduler
+    has to be handed the real context instead.
+    """
+    return GateContext(
+        now=when,
+        retries_used=event.retries_used,
+        contacts_this_cycle=0,
+        last_notice_sent_at=None,
+        stop_requested=False,
+        promise_to_pay=False,
+        dispute_open=False,
+        consent_logged=False,
+        channel=None,
+    )
+
+
+def schedule_for(
+    event: FailureEvent, diagnosis: Diagnosis, action: ActionType
+) -> datetime | None:
+    """Earliest acceptable time for this cause, pushed to the first legal window."""
+    earliest = event.occurred_at + timedelta(
+        hours=ACTION_DELAY_HOURS[diagnosis.cause]
+    )
+    return next_permitted_time(action, earliest, _schedule_context(event, earliest))
+
+
+def budget_pool(action: ActionType) -> str | None:
     """Which budget the action draws on, or None when it consumes neither."""
     if action in RAIL_ACTIONS:
         return RETRY_POOL
@@ -150,7 +273,7 @@ COST_BY_POOL: dict[str, float] = {
 
 
 def _budget_cost(action: ActionType) -> float:
-    pool = _budget_pool(action)
+    pool = budget_pool(action)
     return 0.0 if pool is None else COST_BY_POOL[pool]
 
 
@@ -193,6 +316,7 @@ def _granted(
     action: ActionType,
     score: float,
     breakdown: dict,
+    scheduled_for: datetime,
 ) -> ProposedAction:
     return ProposedAction(
         event_id=event.event_id,
@@ -201,11 +325,11 @@ def _granted(
             f"{diagnosis.cause.value} -> {action.value}: "
             f"p={breakdown['probability']:.2f} at confidence "
             f"{diagnosis.confidence:.2f} ({diagnosis.method}) on "
-            f"{event.amount_paise} paise, index {score:.0f} per budget unit"
+            f"{event.amount_paise} paise, index {score:.0f} per budget unit, "
+            f"booked for {to_ist(scheduled_for):%Y-%m-%d %H:%M} IST"
         ),
         expected_recovery_paise=breakdown["expected_recovery_paise"],
-        scheduled_for=event.occurred_at
-        + timedelta(hours=ACTION_DELAY_HOURS[diagnosis.cause]),
+        scheduled_for=scheduled_for,
     )
 
 
@@ -256,13 +380,18 @@ def allocate(
         diagnosis = by_event[event.event_id]
         action = ActionType(breakdown["action"])
         if action is ActionType.SUPPRESS:
-            actions.append(
-                _suppressed(
-                    event,
-                    f"{SUPPRESSED_FOR_LOW_VALUE}: {diagnosis.cause.value} is not "
-                    f"recoverable by an attempt (p={breakdown['probability']:.2f})",
+            if not has_rail_headroom(event):
+                rationale = (
+                    f"{SUPPRESSED_FOR_NO_HEADROOM}: {diagnosis.cause.value} needs a "
+                    f"rail attempt but retries_used={event.retries_used} is at the "
+                    f"NPCI cap of {NPCI_RETRY_CAP}"
                 )
-            )
+            else:
+                rationale = (
+                    f"{SUPPRESSED_FOR_LOW_VALUE}: {diagnosis.cause.value} is not "
+                    f"recoverable by an attempt (p={breakdown['probability']:.2f})"
+                )
+            actions.append(_suppressed(event, rationale))
             continue
         if diagnosis.confidence < MIN_ACTIONABLE_CONFIDENCE:
             actions.append(
@@ -274,7 +403,18 @@ def allocate(
                 )
             )
             continue
-        pool = _budget_pool(action)
+        scheduled = schedule_for(event, diagnosis, action)
+        if scheduled is None:
+            actions.append(
+                _suppressed(
+                    event,
+                    f"{SUPPRESSED_FOR_NO_WINDOW}: no moment in the next "
+                    f"{SCHEDULING_HORIZON_HOURS}h lets {action.value} through the "
+                    "gate's clock rules",
+                )
+            )
+            continue
+        pool = budget_pool(action)
         if pool is not None:
             if spent[pool] >= limits[pool]:
                 actions.append(
@@ -287,7 +427,7 @@ def allocate(
                 continue
             spent[pool] += 1
             cut[pool] = score
-        actions.append(_granted(event, diagnosis, action, score, breakdown))
+        actions.append(_granted(event, diagnosis, action, score, breakdown, scheduled))
 
     counts = Counter(action.action.value for action in actions)
     stats = {
@@ -308,6 +448,12 @@ def allocate(
         "suppressed_for_low_confidence": sum(
             action.rationale.startswith(SUPPRESSED_FOR_LOW_CONFIDENCE)
             for action in actions
+        ),
+        "suppressed_for_no_headroom": sum(
+            action.rationale.startswith(SUPPRESSED_FOR_NO_HEADROOM) for action in actions
+        ),
+        "suppressed_for_no_window": sum(
+            action.rationale.startswith(SUPPRESSED_FOR_NO_WINDOW) for action in actions
         ),
     }
     return actions, stats

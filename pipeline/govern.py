@@ -20,6 +20,21 @@ CONTACT_ACTIONS: frozenset[ActionType] = frozenset(
 )
 DLT_CHANNELS: frozenset[str] = frozenset({"sms", "voice"})
 
+# NPCI permits one execution plus three retries per mandate cycle. Exported so
+# the allocator can screen out mandates with no headroom rather than proposing
+# attempts this gate would refuse.
+NPCI_RETRY_CAP = 3
+
+# The two clock-dependent rules, as half-open [start, end) minute-of-day
+# windows in IST. Exported for the same reason as the cap: allocate schedules
+# around these rather than into them, and a second copy of the boundaries
+# would eventually disagree with the rule that enforces them.
+PEAK_RAIL_WINDOWS: tuple[tuple[int, int], ...] = (
+    (10 * 60, 13 * 60),  # 10:00–12:59, rails frozen
+    (17 * 60, 21 * 60 + 31),  # 17:00–21:30 inclusive, rails frozen
+)
+CONTACT_WINDOW: tuple[int, int] = (8 * 60, 19 * 60)  # 08:00–18:59, contact allowed
+
 R01_RAIL_CAP = "r01_rail_cap"
 R01_RAIL_CAP_DESC = "NPCI: one execution plus three retries; freeze rails in peak IST windows."
 R02_PREDEBIT_NOTICE = "r02_predebit_notice"
@@ -60,29 +75,37 @@ class GateContext(BaseModel):
     channel: str | None
 
 
-def _ist(stamp: datetime) -> datetime:
+def to_ist(stamp: datetime) -> datetime:
     if stamp.tzinfo is None:
         return stamp.replace(tzinfo=IST)
     return stamp.astimezone(IST)
 
 
-def _minutes(stamp: datetime) -> int:
-    local = _ist(stamp)
+def minute_of_day(stamp: datetime) -> int:
+    local = to_ist(stamp)
     return local.hour * 60 + local.minute
 
 
-def _in_peak_window(stamp: datetime) -> bool:
-    minute = _minutes(stamp)
-    return (10 * 60 <= minute < 13 * 60) or (17 * 60 <= minute <= 21 * 60 + 30)
+def in_peak_rail_window(stamp: datetime) -> bool:
+    minute = minute_of_day(stamp)
+    return any(start <= minute < end for start, end in PEAK_RAIL_WINDOWS)
+
+
+def in_contact_hours(stamp: datetime) -> bool:
+    start, end = CONTACT_WINDOW
+    return start <= minute_of_day(stamp) < end
 
 
 def r01_rail_cap(action: ProposedAction, ctx: GateContext) -> tuple[bool, str]:
     """Block RETRY/MANDATE_REPRESENT at NPCI retry cap or in peak IST windows."""
     if action.action not in RAIL_ACTIONS:
         return True, "not a rail action"
-    if ctx.retries_used >= 3:
-        return False, f"retries_used={ctx.retries_used} (>= 3; NPCI: one execution plus three retries)"
-    if _in_peak_window(ctx.now):
+    if ctx.retries_used >= NPCI_RETRY_CAP:
+        return False, (
+            f"retries_used={ctx.retries_used} (>= {NPCI_RETRY_CAP}; "
+            "NPCI: one execution plus three retries)"
+        )
+    if in_peak_rail_window(ctx.now):
         return False, "peak window 10:00–13:00 or 17:00–21:30 IST"
     return True, "rail cap ok"
 
@@ -93,7 +116,7 @@ def r02_predebit_notice(action: ProposedAction, ctx: GateContext) -> tuple[bool,
         return True, "not mandate represent"
     if ctx.last_notice_sent_at is None:
         return False, "no pre-debit notice on file"
-    if _ist(ctx.now) - _ist(ctx.last_notice_sent_at) < timedelta(hours=24):
+    if to_ist(ctx.now) - to_ist(ctx.last_notice_sent_at) < timedelta(hours=24):
         return False, "pre-debit notice younger than 24 hours"
     return True, "pre-debit notice aged in"
 
@@ -137,8 +160,7 @@ def r06_quiet_hours(action: ProposedAction, ctx: GateContext) -> tuple[bool, str
     """
     if action.action not in CONTACT_ACTIONS:
         return True, "not a contact action"
-    minute = _minutes(ctx.now)
-    if not (8 * 60 <= minute <= 18 * 60 + 59):
+    if not in_contact_hours(ctx.now):
         return False, "outside contact hours 08:00–18:59 IST"
     return True, "inside contact hours"
 

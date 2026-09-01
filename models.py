@@ -99,6 +99,29 @@ class GateDecision(BaseModel):
     reason: str
 
 
+class BatchResult(BaseModel):
+    """What one policy did to one batch, and what it recovered."""
+
+    model_config = ConfigDict(frozen=True)
+
+    policy: Literal["agent", "control"]
+    events_processed: int
+    actions_by_type: dict[str, int]
+    blocked_by_rule: dict[str, int]
+    gross_recovered_paise: int
+    # Budget spent means budget actually placed: an action the gate refused is
+    # reclaimed and re-offered, so this never counts an attempt that never ran.
+    retry_budget_spent: int
+    contact_budget_spent: int
+    allocation_passes: int
+    suppressed_for_budget: int
+    suppressed_for_low_value: int
+    suppressed_for_low_confidence: int
+    suppressed_for_no_headroom: int
+    suppressed_for_no_window: int
+    ledger_path: str
+
+
 class LedgerEntry(BaseModel):
     model_config = ConfigDict(frozen=True)
 
