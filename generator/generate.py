@@ -142,6 +142,9 @@ def generate_batch(n: int = 500, seed: int = 42) -> list[FailureEvent]:
     offsets = rng.random(n) * 24 * 3600
     ambiguous_mask = rng.random(n) < 0.25
 
+    # Mix target is ~18% technical. The two outage windows add extra
+    # ISSUER_DOWNTIME on top, so seed 42 lands at ~28% technical
+    # (139/500: 99 downtime + 40 timeout). That lift is intentional.
     span_start = ANCHOR - timedelta(hours=24)
     windows: list[tuple[str, datetime, datetime]] = []
     outage_of = np.full(n, -1, dtype=int)

@@ -1,44 +1,19 @@
-"""Throwaway spike: validate chainladder Triangle API on RAA and synthetic chargebacks."""
+"""Throwaway spike: validate chainladder Triangle API on RAA and generate_history()."""
 
 from __future__ import annotations
+
+import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import chainladder as cl
 
+_ROOT = Path(__file__).resolve().parents[1]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
-VALUATION_MONTH: pd.Timestamp = pd.Timestamp("2026-09-01")
-AMOUNT_PAISE: tuple[int, ...] = (14900, 29900, 49900, 99900)
-AMOUNT_WEIGHTS: tuple[float, ...] = (0.40, 0.35, 0.18, 0.07)
-
-LAG_MU: float = float(np.log(42.0))
-LAG_SIGMA: float = 0.45
-
-
-def generate_disputes(n: int = 2000, seed: int = 42) -> pd.DataFrame:
-    """Synthetic recovered-card rows; returns only the disputed subset."""
-    rng = np.random.default_rng(seed)
-    origin_months = pd.date_range(end=VALUATION_MONTH, periods=6, freq="MS")
-    cohort_month = rng.choice(origin_months.to_numpy(), size=n)
-    amount_paise = rng.choice(AMOUNT_PAISE, size=n, p=AMOUNT_WEIGHTS).astype(int)
-    disputed = rng.random(n) < 0.02
-    lag_days = np.clip(rng.lognormal(LAG_MU, LAG_SIGMA, size=n), 1.0, 120.0)
-
-    frame = pd.DataFrame(
-        {
-            "cohort_month": pd.to_datetime(cohort_month),
-            "amount_paise": amount_paise,
-            "disputed": disputed,
-            "lag_days": lag_days,
-        }
-    )
-    frame = frame.loc[frame["disputed"]].copy()
-    frame["dispute_month"] = (
-        (frame["cohort_month"] + pd.to_timedelta(frame["lag_days"], unit="D"))
-        .dt.to_period("M")
-        .dt.to_timestamp()
-    )
-    return frame[["cohort_month", "dispute_month", "amount_paise"]].reset_index(drop=True)
+from generator.generate import VALUATION_MONTH, generate_history
 
 
 def selected_ldfs(model: cl.Chainladder) -> np.ndarray:
@@ -65,9 +40,9 @@ def print_fit(triangle: cl.Triangle, model: cl.Chainladder) -> None:
 
 
 def verdict(model: cl.Chainladder) -> None:
-    print("\n" + "=" * 72)
-    print("PART C — VERDICT (synthetic chargeback triangle)")
-    print("=" * 72)
+
+    print("PART C — VERDICT (generate_history chargeback triangle)")
+
 
     ldfs = selected_ldfs(model)
     ibnr = ibnr_by_origin(model)
@@ -118,10 +93,10 @@ def main() -> None:
     raa_model = cl.Chainladder().fit(raa)
     print_fit(raa, raa_model)
 
-    print("\n" + "=" * 72, flush=True)
-    print("PART B — synthetic chargeback triangle", flush=True)
-    print("=" * 72, flush=True)
-    disputes = generate_disputes(n=2000, seed=42)
+
+    print("PART B — generate_history() chargeback triangle (18 cohorts)", flush=True)
+
+    disputes = generate_history(n=50_000, cohorts=18, seed=42, valuation_cutoff=None)
     observed = disputes.loc[disputes["dispute_month"] <= VALUATION_MONTH].copy()
     held_out = disputes.loc[disputes["dispute_month"] > VALUATION_MONTH]
     true_ibnr = held_out.groupby(held_out["cohort_month"].dt.to_period("M"))[
@@ -130,6 +105,7 @@ def main() -> None:
     print(
         f"disputed rows={len(disputes)}  "
         f"observed through {VALUATION_MONTH.date()}={len(observed)}  "
+        f"cohorts={observed['cohort_month'].dt.to_period('M').nunique()}  "
         f"(future disputes held out as IBNR)"
     )
     print("true held-out IBNR by cohort (paise):")
