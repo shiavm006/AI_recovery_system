@@ -231,16 +231,41 @@ def test_budget_placed_equals_actions_that_cleared_the_gate(tmp_path):
 
 def test_agent_never_proposes_a_rail_action_it_has_no_headroom_for(tmp_path):
     path = tmp_path / "screen.db"
+    # A reason the rule layer resolves, so these get a real diagnosis and reach
+    # the headroom screen rather than stopping at UNKNOWN with no provider.
     events = [
-        _event(i, RootCause.NETWORK_TIMEOUT).model_copy(
-            update={"retries_used": NPCI_RETRY_CAP}
+        _event(i).model_copy(
+            update={
+                "retries_used": NPCI_RETRY_CAP,
+                "error_reason": "insufficient_funds",
+            }
         )
         for i in range(10)
     ]
     result = run_batch(events, policy=AGENT, ledger_path=str(path), retry_budget=10)
+    assert result.unknown_diagnoses == 0
     assert result.retry_budget_spent == 0
     assert "r01_rail_cap" not in result.blocked_by_rule
     assert result.suppressed_for_no_headroom == len(events)
+
+
+def test_a_degraded_run_is_reported_as_undiagnosed(tmp_path):
+    # With no provider, the ambiguous reasons cannot be diagnosed. They must
+    # show up as UNKNOWN rather than being absorbed into a real cause.
+    path = tmp_path / "degraded.db"
+    events = [_event(i) for i in range(10)]
+    result = run_batch(events, policy=AGENT, ledger_path=str(path), retry_budget=10)
+
+    assert result.unknown_diagnoses == len(events)
+    assert result.suppressed_for_no_diagnosis == len(events)
+    assert result.retry_budget_spent == 0
+    assert result.gross_recovered_paise == 0
+
+    diagnosed = [
+        entry for entry in Ledger(str(path)).read_all() if entry.entry_type == "diagnosed"
+    ]
+    assert {entry.payload["cause"] for entry in diagnosed} == {"UNKNOWN"}
+    assert all("no diagnosis" in entry.payload["evidence"][0] for entry in diagnosed)
 
 
 def test_control_records_that_it_did_not_diagnose(tmp_path):

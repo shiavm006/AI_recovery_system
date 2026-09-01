@@ -37,6 +37,10 @@ BASE_RECOVERY_PROBABILITY: dict[RootCause, float] = {
     RootCause.DEAD_MANDATE: 0.35,  # recoverable, but only by re-presenting the mandate
     RootCause.HARD_DECLINE: 0.02,  # the issuer refused the instrument outright
     RootCause.RISK_BLOCK: 0.01,  # blocked deliberately; retrying is the wrong answer
+    # Not an estimate. UNKNOWN means diagnosis failed, and zero keeps the
+    # scoring function total so ranking cannot raise on it; the SUPPRESS
+    # mapping below is what actually keeps it away from the budget.
+    RootCause.UNKNOWN: 0.0,
 }
 
 # Indian salary credits cluster at month end and month start, so a balance
@@ -87,6 +91,12 @@ INTERVENTION_BY_CAUSE: dict[RootCause, ActionType] = {
     RootCause.DEAD_MANDATE: ActionType.MANDATE_REPRESENT,
     RootCause.HARD_DECLINE: ActionType.SUPPRESS,
     RootCause.RISK_BLOCK: ActionType.SUPPRESS,
+    # Belt and braces. Every UNKNOWN this pipeline produces comes from
+    # diagnose._fallback at confidence 0.0, so MIN_ACTIONABLE_CONFIDENCE below
+    # would already exclude it. The mapping is not redundant though: it is the
+    # only guard against an UNKNOWN arriving with high confidence, which the
+    # floor would wave straight through.
+    RootCause.UNKNOWN: ActionType.SUPPRESS,
 }
 
 # A diagnosis we do not believe is not worth a scarce attempt. diagnose.py
@@ -101,6 +111,7 @@ SUPPRESSED_FOR_BUDGET = "excluded for budget"
 SUPPRESSED_FOR_LOW_VALUE = "excluded for low expected value"
 SUPPRESSED_FOR_LOW_CONFIDENCE = "excluded for low diagnostic confidence"
 SUPPRESSED_FOR_NO_HEADROOM = "excluded for no mandate headroom"
+SUPPRESSED_FOR_NO_DIAGNOSIS = "no diagnosis available"
 SUPPRESSED_FOR_NO_WINDOW = "excluded for no permitted window"
 
 # How far past the earliest acceptable time the scheduler will hunt for a legal
@@ -380,7 +391,12 @@ def allocate(
         diagnosis = by_event[event.event_id]
         action = ActionType(breakdown["action"])
         if action is ActionType.SUPPRESS:
-            if not has_rail_headroom(event):
+            if diagnosis.cause is RootCause.UNKNOWN:
+                rationale = (
+                    f"{SUPPRESSED_FOR_NO_DIAGNOSIS}: "
+                    f"{'; '.join(diagnosis.evidence) or 'reason not recorded'}"
+                )
+            elif not has_rail_headroom(event):
                 rationale = (
                     f"{SUPPRESSED_FOR_NO_HEADROOM}: {diagnosis.cause.value} needs a "
                     f"rail attempt but retries_used={event.retries_used} is at the "
@@ -454,6 +470,10 @@ def allocate(
         ),
         "suppressed_for_no_window": sum(
             action.rationale.startswith(SUPPRESSED_FOR_NO_WINDOW) for action in actions
+        ),
+        "suppressed_for_no_diagnosis": sum(
+            action.rationale.startswith(SUPPRESSED_FOR_NO_DIAGNOSIS)
+            for action in actions
         ),
     }
     return actions, stats

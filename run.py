@@ -37,6 +37,7 @@ from pipeline.allocate import (
     SUPPRESSED_FOR_BUDGET,
     SUPPRESSED_FOR_LOW_CONFIDENCE,
     SUPPRESSED_FOR_LOW_VALUE,
+    SUPPRESSED_FOR_NO_DIAGNOSIS,
     SUPPRESSED_FOR_NO_HEADROOM,
     SUPPRESSED_FOR_NO_WINDOW,
     allocate,
@@ -431,6 +432,8 @@ def run_batch(
         suppressed_for_low_confidence=suppressed_for(SUPPRESSED_FOR_LOW_CONFIDENCE),
         suppressed_for_no_headroom=suppressed_for(SUPPRESSED_FOR_NO_HEADROOM),
         suppressed_for_no_window=suppressed_for(SUPPRESSED_FOR_NO_WINDOW),
+        unknown_diagnoses=sum(d.cause is RootCause.UNKNOWN for d in diagnoses),
+        suppressed_for_no_diagnosis=suppressed_for(SUPPRESSED_FOR_NO_DIAGNOSIS),
         ledger_path=ledger_path,
     )
 
@@ -442,6 +445,7 @@ def _print_comparison(agent: BatchResult, control: BatchResult) -> None:
     print(f"\n  {'':<32}{'AGENT':>16}{'CONTROL':>16}")
     print("  " + "-" * 64)
     row("events processed", agent.events_processed, control.events_processed)
+    row("UNDIAGNOSED (cause=UNKNOWN)", agent.unknown_diagnoses, control.unknown_diagnoses)
     for action in ActionType:
         if agent.actions_by_type.get(action.value) or control.actions_by_type.get(
             action.value
@@ -467,6 +471,7 @@ def _print_comparison(agent: BatchResult, control: BatchResult) -> None:
     row("suppressed low confidence", agent.suppressed_for_low_confidence, control.suppressed_for_low_confidence)
     row("suppressed no headroom", agent.suppressed_for_no_headroom, control.suppressed_for_no_headroom)
     row("suppressed no window", agent.suppressed_for_no_window, control.suppressed_for_no_window)
+    row("suppressed no diagnosis", agent.suppressed_for_no_diagnosis, control.suppressed_for_no_diagnosis)
     print("  " + "-" * 64)
     row("gross recovered (paise)", agent.gross_recovered_paise, control.gross_recovered_paise)
     row(
@@ -481,6 +486,12 @@ def _print_comparison(agent: BatchResult, control: BatchResult) -> None:
         else float("inf")
     )
     print(f"\n  agent recovers {lift / 100:,.0f} rupees more ({ratio:.2f}x control)")
+    if agent.unknown_diagnoses:
+        share = agent.unknown_diagnoses / agent.events_processed
+        print(
+            f"\n  DEGRADED: {agent.unknown_diagnoses} events ({share:.0%}) could not be "
+            "diagnosed and were declined, not guessed at."
+        )
 
 
 if __name__ == "__main__":

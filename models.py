@@ -16,6 +16,10 @@ class RootCause(str, Enum):
     NETWORK_TIMEOUT = "NETWORK_TIMEOUT"
     HARD_DECLINE = "HARD_DECLINE"
     RISK_BLOCK = "RISK_BLOCK"
+    # Not a cause: the absence of one. Recorded when the pipeline could not
+    # obtain a diagnosis, so a degraded run shows up as its own category
+    # instead of being absorbed into whichever real cause was most plausible.
+    UNKNOWN = "UNKNOWN"
 
 
 class ActionType(str, Enum):
@@ -119,6 +123,10 @@ class BatchResult(BaseModel):
     suppressed_for_low_confidence: int
     suppressed_for_no_headroom: int
     suppressed_for_no_window: int
+    # Events the pipeline could not diagnose at all. Reported on its own so a
+    # degraded run is visible rather than buried in the cause distribution.
+    unknown_diagnoses: int
+    suppressed_for_no_diagnosis: int
     ledger_path: str
 
 

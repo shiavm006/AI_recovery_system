@@ -72,8 +72,12 @@ _stats: dict = {
     "llm_errors": [],
     "unique_signatures": 0,
     "unique_cache_keys": 0,
+    "fallback_reasons": Counter(),
 }
 _gemini_client = None
+# The most recent provider failure, so a fallback can name the actual cause
+# rather than the category it fell into.
+_last_error: str | None = None
 
 
 class _LlmItem(BaseModel):
@@ -157,8 +161,19 @@ def _key_for(provider: str) -> str:
     return os.getenv(env_name, "").strip()
 
 
-def _note_error(exc: BaseException) -> None:
-    _stats["llm_errors"].append(f"{type(exc).__name__}: {exc}")
+def _note_error(exc: BaseException) -> str:
+    """Record a provider failure and surface it immediately.
+
+    Accumulating these in stats alone means a degraded run is only visible to
+    whoever reads the returned dict. Logging at the point of failure puts the
+    specific error in front of the operator while the run is happening.
+    """
+    global _last_error
+    detail = f"{type(exc).__name__}: {exc}"
+    _last_error = detail
+    _stats["llm_errors"].append(detail)
+    log.error("llm provider failure: %s", detail)
+    return detail
 
 
 class LlmProvider(Protocol):
@@ -256,12 +271,24 @@ def diagnose_by_rule(
 
 
 def _fallback(event: FailureEvent, why: str) -> Diagnosis:
+    """Record that no diagnosis was obtained instead of inventing one.
+
+    This used to return INSUFFICIENT_FUNDS at confidence 0.0. That is both the
+    most common real cause and the highest-scoring one in allocate, so a failed
+    LLM call did not merely lose information — it manufactured plausible demand
+    for the retry budget. On a 500-event batch with the provider off it inflated
+    INSUFFICIENT_FUNDS from ~192 to 321, and nothing in the output said so.
+
+    ``why`` is the specific failure, not a category, so the evidence on the
+    event distinguishes a missing package from a 401 from a malformed response.
+    """
     _stats["fallbacks"] += 1
+    _stats["fallback_reasons"][why] += 1
     return Diagnosis(
         event_id=event.event_id,
-        cause=RootCause.INSUFFICIENT_FUNDS,
+        cause=RootCause.UNKNOWN,
         confidence=0.0,
-        evidence=[f"llm fallback fired: {why}"],
+        evidence=[f"no diagnosis: {why}"],
         method="llm",
     )
 
@@ -275,8 +302,17 @@ def _strip_fences(text: str) -> str:
     return text.strip()
 
 
+# UNKNOWN records that the pipeline failed to get an answer, which is not a
+# verdict a classifier is entitled to reach, so it is not offered as an option.
+# The response schema still admits it — the enum is shared — and allocate
+# suppresses it either way.
+CLASSIFIABLE_CAUSES: tuple[RootCause, ...] = tuple(
+    cause for cause in RootCause if cause is not RootCause.UNKNOWN
+)
+
+
 def _classify_prompt(events: list[FailureEvent]) -> str:
-    causes = ", ".join(member.value for member in RootCause)
+    causes = ", ".join(member.value for member in CLASSIFIABLE_CAUSES)
     catalog = [
         {
             "index": i,
@@ -439,13 +475,21 @@ PROVIDERS: dict[str, LlmProvider] = {
 }
 
 
-def _call_llm(events: list[FailureEvent]) -> list[_LlmItem] | None:
+def _call_llm(events: list[FailureEvent]) -> tuple[list[_LlmItem] | None, str]:
+    """Call the provider and report why it failed, if it did.
+
+    The reason travels with the result so the fallback can put the actual
+    error on the event instead of a category name; every provider path already
+    routes its exception through :func:`_note_error`.
+    """
+    global _last_error
+    _last_error = None
     name = _provider_name()
     provider = PROVIDERS.get(name)
     if provider is None:
-        _note_error(RuntimeError(f"unknown NAKAD_LLM_PROVIDER={name!r}"))
-        return None
-    return provider(events)
+        return None, _note_error(RuntimeError(f"unknown NAKAD_LLM_PROVIDER={name!r}"))
+    items = provider(events)
+    return items, _last_error or "provider returned no usable items"
 
 
 def diagnose_by_llm(events: list[FailureEvent]) -> list[Diagnosis]:
@@ -469,15 +513,15 @@ def diagnose_by_llm(events: list[FailureEvent]) -> list[Diagnosis]:
     _stats["unique_cache_keys"] = len(order)
 
     if name == "none":
-        _note_error(RuntimeError("NAKAD_LLM_PROVIDER=none"))
-        return [_fallback(event, "provider=none") for event in events]
+        detail = _note_error(RuntimeError("NAKAD_LLM_PROVIDER=none"))
+        return [_fallback(event, detail) for event in events]
     if name not in PROVIDERS:
-        _note_error(RuntimeError(f"unknown NAKAD_LLM_PROVIDER={name!r}"))
-        return [_fallback(event, f"unknown provider {name}") for event in events]
+        detail = _note_error(RuntimeError(f"unknown NAKAD_LLM_PROVIDER={name!r}"))
+        return [_fallback(event, detail) for event in events]
     if not key_found:
         env_name = _KEY_ENV.get(name, "API_KEY")
-        _note_error(RuntimeError(f"no {env_name}"))
-        return [_fallback(event, f"no {env_name}") for event in events]
+        detail = _note_error(RuntimeError(f"no {env_name} in environment"))
+        return [_fallback(event, detail) for event in events]
 
     diagnoses: list[Diagnosis | None] = [None] * len(events)
     uncached: list[CacheKey] = []
@@ -503,19 +547,19 @@ def diagnose_by_llm(events: list[FailureEvent]) -> list[Diagnosis]:
             batch_keys = uncached[offset : offset + 20]
             _stats["llm_calls"] += 1
             reps = [events[by_key[key][0]] for key in batch_keys]
-            items = _call_llm(reps)
+            items, reason = _call_llm(reps)
             for position, key in enumerate(batch_keys):
                 indices = by_key[key]
                 if items is None:
                     for index in indices:
-                        diagnoses[index] = _fallback(events[index], "api or parse failure")
+                        diagnoses[index] = _fallback(events[index], reason)
                     continue
                 try:
                     item = items[position]
                 except IndexError as exc:
-                    _note_error(exc)
+                    detail = _note_error(exc)
                     for index in indices:
-                        diagnoses[index] = _fallback(events[index], "invalid enum or item")
+                        diagnoses[index] = _fallback(events[index], detail)
                     continue
                 _cache[key] = (item.cause, item.confidence, list(item.evidence))
                 for hit, index in enumerate(indices):
@@ -532,7 +576,12 @@ def diagnose_by_llm(events: list[FailureEvent]) -> list[Diagnosis]:
         if name == "gemini":
             _close_gemini_client()
 
-    return [item if item is not None else _fallback(events[i], "missing") for i, item in enumerate(diagnoses)]
+    return [
+        item
+        if item is not None
+        else _fallback(events[i], "no result returned for this event")
+        for i, item in enumerate(diagnoses)
+    ]
 
 
 def diagnose_batch(events: list[FailureEvent]) -> tuple[list[Diagnosis], dict]:
@@ -544,6 +593,7 @@ def diagnose_batch(events: list[FailureEvent]) -> tuple[list[Diagnosis], dict]:
     _stats["llm_errors"] = []
     _stats["unique_signatures"] = 0
     _stats["unique_cache_keys"] = 0
+    _stats["fallback_reasons"] = Counter()
 
     name = _provider_name()
     log.info("LLM provider selected: %s; key found: %s", name, bool(_key_for(name)))
@@ -563,6 +613,18 @@ def diagnose_batch(events: list[FailureEvent]) -> tuple[list[Diagnosis], dict]:
         diagnoses[index] = result
 
     filled = [item for item in diagnoses if item is not None]
+    if _stats["fallbacks"]:
+        log.error(
+            "degraded run: %d of %d events have no diagnosis (cause=UNKNOWN); "
+            "distinct reasons: %s",
+            _stats["fallbacks"],
+            len(events),
+            "; ".join(
+                f"{reason} (x{count})"
+                for reason, count in _stats["fallback_reasons"].most_common()
+            ),
+        )
+
     by_method = Counter(item.method for item in filled)
     stats = {
         "by_method": dict(by_method),
@@ -572,6 +634,7 @@ def diagnose_batch(events: list[FailureEvent]) -> tuple[list[Diagnosis], dict]:
         "unique_signatures": _stats["unique_signatures"],
         "unique_cache_keys": _stats["unique_cache_keys"],
         "llm_errors": list(_stats["llm_errors"]),
+        "fallback_reasons": dict(_stats["fallback_reasons"]),
     }
     return filled, stats
 

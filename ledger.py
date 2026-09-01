@@ -1,20 +1,3 @@
-"""Append-only hash-chained ledger backed by SQLite.
-
-A hash chain only proves that the rows still present agree with each other. It
-says nothing about rows that are gone: delete the tail, or the whole table, and
-what remains is a shorter chain that is internally perfect. So the chain is
-anchored by a separate one-row ``chain_tip`` table recording how long the chain
-is and what its last hash was, written in the same transaction as the entry.
-Removing rows now contradicts the tip, and removing the tip too is itself the
-detectable state.
-
-This raises the bar; it does not make the ledger tamper-proof. Anyone who can
-write to the file can rewrite the entries, recompute every hash, and update the
-tip to match. Detecting that needs the tip published somewhere this process
-cannot reach — a second store, a countersigning service, or an append-only log
-outside SQLite.
-"""
-
 from __future__ import annotations
 
 import hashlib

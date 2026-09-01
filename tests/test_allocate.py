@@ -19,6 +19,7 @@ from pipeline.allocate import (
     SUPPRESSED_FOR_BUDGET,
     SUPPRESSED_FOR_LOW_CONFIDENCE,
     SUPPRESSED_FOR_LOW_VALUE,
+    SUPPRESSED_FOR_NO_DIAGNOSIS,
     SUPPRESSED_FOR_NO_HEADROOM,
     SUPPRESSED_FOR_NO_WINDOW,
     allocate,
@@ -419,6 +420,68 @@ def test_no_allocated_action_is_ever_booked_into_a_forbidden_window():
             assert not in_peak_rail_window(action.scheduled_for)
         if action.action in CONTACT_ACTIONS:
             assert in_contact_hours(action.scheduled_for)
+
+
+def test_unknown_always_suppresses_whatever_the_amount_or_budget():
+    for amount in (100, 99_900, 50_000_000):
+        event = _event("undiagnosed", amount, PAYDAY)
+        diagnosis = _diagnosis("undiagnosed", RootCause.UNKNOWN, confidence=0.0)
+        assert intervention_for(event, diagnosis) is ActionType.SUPPRESS
+
+        actions, stats = allocate(
+            [event], [diagnosis], retry_budget=99, contact_budget=99
+        )
+        assert actions[0].action is ActionType.SUPPRESS
+        assert actions[0].rationale.startswith(SUPPRESSED_FOR_NO_DIAGNOSIS)
+        assert actions[0].expected_recovery_paise == 0
+        assert stats["retry_budget_spent"] == 0
+        assert stats["contact_budget_spent"] == 0
+        assert stats["suppressed_for_no_diagnosis"] == 1
+
+
+def test_unknown_suppresses_even_when_the_confidence_floor_would_not_catch_it():
+    # The belt-and-braces claim: every UNKNOWN this pipeline emits carries
+    # confidence 0.0, so the floor already excludes it. The cause mapping is
+    # what covers an UNKNOWN that arrives believed, which the floor would pass.
+    event = _event("confident-nonsense", 99_900, PAYDAY)
+    diagnosis = _diagnosis("confident-nonsense", RootCause.UNKNOWN, confidence=1.0)
+    assert diagnosis.confidence >= MIN_ACTIONABLE_CONFIDENCE
+
+    actions, stats = allocate([event], [diagnosis], retry_budget=99, contact_budget=99)
+    assert actions[0].action is ActionType.SUPPRESS
+    assert actions[0].rationale.startswith(SUPPRESSED_FOR_NO_DIAGNOSIS)
+    assert stats["suppressed_for_low_confidence"] == 0
+    assert stats["retry_budget_spent"] == 0
+
+
+def test_unknown_scores_zero_and_ranks_below_every_real_cause():
+    event = _event("e1", 99_900, PAYDAY)
+    unknown_score, breakdown = index_score(
+        event, _diagnosis("e1", RootCause.UNKNOWN, confidence=1.0)
+    )
+    assert unknown_score == 0.0
+    assert breakdown["expected_recovery_paise"] == 0
+    for cause in RootCause:
+        if cause is RootCause.UNKNOWN:
+            continue
+        real, _ = index_score(event, _diagnosis("e1", cause, confidence=1.0))
+        assert real >= unknown_score
+
+
+def test_undiagnosed_events_never_displace_diagnosed_ones():
+    # The failure the old fallback caused: fabricated diagnoses competing for,
+    # and winning, a budget that should have gone to real work.
+    real = [_event(f"real{i}", 10_000, PAYDAY) for i in range(3)]
+    unknown = [_event(f"unknown{i}", 99_900, PAYDAY) for i in range(20)]
+    diagnoses = [
+        _diagnosis(event.event_id, RootCause.NETWORK_TIMEOUT) for event in real
+    ] + [_diagnosis(event.event_id, RootCause.UNKNOWN, confidence=0.0) for event in unknown]
+
+    actions, stats = allocate(real + unknown, diagnoses, retry_budget=3, contact_budget=0)
+    granted = {a.event_id for a in actions if a.action is not ActionType.SUPPRESS}
+    assert granted == {"real0", "real1", "real2"}
+    assert stats["retry_budget_spent"] == 3
+    assert stats["suppressed_for_no_diagnosis"] == len(unknown)
 
 
 def test_breakdown_contributions_sum_to_score():
