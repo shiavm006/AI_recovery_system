@@ -1,5 +1,3 @@
-"""Shared domain models for the payment-recovery pipeline."""
-
 from __future__ import annotations
 
 from datetime import datetime

@@ -1,15 +1,3 @@
-"""One batch, end to end, under two policies that share every downstream stage.
-
-The agent diagnoses, ranks and spends a capped budget. The control is the
-fixed-schedule retry every dunning tool ships: first N failures in arrival
-order get a retry, the rest get nothing. Both pass through the same policy
-gate and write the same four-entry trace to a ledger, so the only difference
-between the arms is which events were chosen.
-
-No money moves, so outcomes are simulated. See :func:`simulate_outcomes` for
-why the simulator reads ``true_cause`` when the pipeline may not.
-"""
-
 from __future__ import annotations
 
 import random
