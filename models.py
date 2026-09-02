@@ -113,6 +113,9 @@ class BatchResult(BaseModel):
     actions_by_type: dict[str, int]
     blocked_by_rule: dict[str, int]
     gross_recovered_paise: int
+    # Split by payment method because chargeback exposure is card-only: UPI
+    # Autopay and NACH disputes run through different mechanisms entirely.
+    recovered_by_method: dict[str, int]
     # Budget spent means budget actually placed: an action the gate refused is
     # reclaimed and re-offered, so this never counts an attempt that never ran.
     retry_budget_spent: int

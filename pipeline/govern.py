@@ -60,6 +60,31 @@ RULES: dict[str, str] = {
     R07_HALT: R07_HALT_DESC,
 }
 
+BINDING = "binding"  # a regulator can penalise you for breaking it
+CONTRACT = "contract"  # a platform can cut you off for breaking it
+VOLUNTARY = "voluntary"  # nobody makes us do this; we do it anyway
+
+# Kept beside RULES so the claim about a rule and the rule itself move
+# together. Overstating standing is the failure mode worth guarding against:
+# calling a self-imposed courtesy a legal requirement is the kind of thing
+# that survives right up until someone in the audience actually knows the
+# regulation.
+RULE_STANDING: dict[str, tuple[str, str]] = {
+    R01_RAIL_CAP: (BINDING, "NPCI mandate-cycle retry limits"),
+    R02_PREDEBIT_NOTICE: (BINDING, "RBI/NPCI 24-hour pre-debit notification"),
+    R03_DLT_TEMPLATE: (BINDING, "TRAI TCCCPR 2018, DLT-registered templates"),
+    R04_WHATSAPP_POLICY: (CONTRACT, "Meta WhatsApp Business Messaging Policy"),
+    R05_CONSENT: (BINDING, "DPDP Act 2023 consent for commercial contact"),
+    # RBI's recovery-agent hours bind lenders and their agents. A merchant
+    # chasing a failed subscription debit is not a recovery agent, so this is
+    # borrowed, not owed.
+    R06_QUIET_HOURS: (VOLUNTARY, "modelled on RBI recovery-agent hours"),
+    # Honouring a stop request is binding under DPDP consent withdrawal.
+    # Standing down for a promise-to-pay or an open dispute is not required of
+    # anyone; it is restraint, and it is the part worth pointing at.
+    R07_HALT: (VOLUNTARY, "stop request is binding; promise-to-pay and dispute are restraint"),
+}
+
 
 class GateContext(BaseModel):
     model_config = ConfigDict(frozen=True)

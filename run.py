@@ -408,6 +408,11 @@ def run_batch(
     def suppressed_for(prefix: str) -> int:
         return sum(action.rationale.startswith(prefix) for action in plan["actions"])
 
+    recovered_by_method: Counter[str] = Counter()
+    for event in events:
+        if outcomes[event.event_id]:
+            recovered_by_method[event.method] += event.amount_paise
+
     return BatchResult(
         policy=policy,
         events_processed=len(events),
@@ -424,6 +429,7 @@ def run_batch(
         gross_recovered_paise=sum(
             event.amount_paise for event in events if outcomes[event.event_id]
         ),
+        recovered_by_method=dict(recovered_by_method),
         retry_budget_spent=plan["retry_spent"],
         contact_budget_spent=plan["contact_spent"],
         allocation_passes=plan["allocation_passes"],

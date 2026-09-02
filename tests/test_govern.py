@@ -18,7 +18,11 @@ from pipeline.govern import (
     R05_CONSENT,
     R06_QUIET_HOURS,
     R07_HALT,
+    RULE_STANDING,
     RULES,
+    BINDING,
+    CONTRACT,
+    VOLUNTARY,
     GateContext,
     evaluate,
     r01_rail_cap,
@@ -259,3 +263,20 @@ def test_passing_decision_lists_all_rule_ids() -> None:
     assert decision.blocked_by is None
     assert decision.rule_ids_passed == list(RULES)
     assert decision.rule_ids_passed != []
+
+
+def test_every_rule_declares_its_standing() -> None:
+    # The console publishes this table, so a rule added without a standing
+    # would be shown to an audience with no claim about what backs it.
+    assert set(RULE_STANDING) == set(RULES)
+    for rule_id, (standing, source) in RULE_STANDING.items():
+        assert standing in {BINDING, CONTRACT, VOLUNTARY}, rule_id
+        assert source.strip(), rule_id
+
+
+def test_the_rules_we_impose_on_ourselves_are_not_claimed_as_law() -> None:
+    # Overstating standing is the failure that matters: r06's contact hours and
+    # r07's promise-to-pay restraint bind lenders and nobody respectively.
+    assert RULE_STANDING[R06_QUIET_HOURS][0] == VOLUNTARY
+    assert RULE_STANDING[R07_HALT][0] == VOLUNTARY
+    assert RULE_STANDING[R04_WHATSAPP_POLICY][0] == CONTRACT
