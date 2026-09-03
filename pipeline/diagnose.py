@@ -1,8 +1,3 @@
-"""Failure diagnosis. Deterministic fleet + rules first; LLM only for leftovers.
-
-Never imports govern.py. Never reads FailureEvent.true_cause.
-"""
-
 from __future__ import annotations
 
 import json
@@ -149,6 +144,14 @@ _KEY_ENV = {
     "gemini": "GEMINI_API_KEY",
 }
 
+# Single source for which model each provider calls, so run_config reports the
+# model that was actually used rather than a second copy of the defaults.
+_MODEL_ENV = {
+    "anthropic": ("ANTHROPIC_MODEL", "claude-sonnet-4-5"),
+    "openai": ("OPENAI_MODEL", "gpt-4o-mini"),
+    "gemini": ("GEMINI_MODEL", "gemini-2.0-flash"),
+}
+
 
 DEFAULT_BATCH_DELAY_SECONDS = 2.0
 
@@ -184,6 +187,39 @@ def _key_for(provider: str) -> str:
     if not env_name:
         return ""
     return os.getenv(env_name, "").strip()
+
+
+def _model_name(provider: str) -> str:
+    """The model this provider would actually call, defaults included."""
+    env_name, default = _MODEL_ENV.get(provider, ("", ""))
+    return os.getenv(env_name, default).strip() or default if env_name else ""
+
+
+def run_config(diagnoses: list[Diagnosis]) -> dict:
+    """Provenance to travel with anything computed from these diagnoses.
+
+    Every headline number here is downstream of the diagnosis layer, so a run
+    with the provider off still produces real-looking figures that mean
+    something entirely different. Reporting the provider next to the numbers
+    is the only thing that stops the two being confused.
+    """
+    provider = _provider_name()
+    unknown = sum(diagnosis.cause is RootCause.UNKNOWN for diagnosis in diagnoses)
+    # A fallback still carries the method of the layer that failed it, which
+    # would report "llm" for events no LLM ever saw. Counting those separately
+    # keeps by_method a record of work done rather than work attempted.
+    by_method = Counter(
+        "undiagnosed" if diagnosis.cause is RootCause.UNKNOWN else diagnosis.method
+        for diagnosis in diagnoses
+    )
+    return {
+        "provider": provider,
+        "model": _model_name(provider),
+        "events": len(diagnoses),
+        "by_method": {name: by_method[name] for name in sorted(by_method)},
+        "unknown": unknown,
+        "degraded": bool(unknown),
+    }
 
 
 def _note_error(exc: BaseException) -> str:
@@ -395,7 +431,7 @@ def _call_anthropic(events: list[FailureEvent]) -> list[_LlmItem] | None:
         workspace = os.getenv("ANTHROPIC_WORKSPACE_ID", "").strip()
         headers = {"anthropic-workspace-id": workspace} if workspace else None
         message = Anthropic(api_key=key, default_headers=headers).messages.create(
-            model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-5"),
+            model=_model_name("anthropic"),
             max_tokens=4096,
             system="You output only valid JSON matching the requested schema.",
             messages=[{"role": "user", "content": _classify_prompt(events)}],
@@ -446,7 +482,7 @@ def _call_openai(events: list[FailureEvent]) -> list[_LlmItem] | None:
     if not key:
         _note_error(RuntimeError("no OPENAI_API_KEY"))
         return None
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    model = _model_name("openai")
     url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions")
     try:
         mode = _openai_structured_mode()
@@ -655,7 +691,7 @@ def _call_gemini(events: list[FailureEvent]) -> list[_LlmItem] | None:
         if _gemini_client is None:
             _gemini_client = genai.Client(api_key=key)
         response = _gemini_client.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+            model=_model_name("gemini"),
             contents=_classify_prompt(events),
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",

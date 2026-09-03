@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import os
 import statistics
 import sys
 import tempfile
@@ -22,7 +24,7 @@ from generator.generate import (
     generate_history,
 )
 from models import BatchResult, Diagnosis, FailureEvent, RootCause
-from pipeline.diagnose import diagnose_batch
+from pipeline.diagnose import diagnose_batch, run_config
 from run import AGENT, CONTROL, POLICIES, run_batch
 
 # generate_history draws this many payments and disputes ~2.5% of them, but
@@ -324,14 +326,59 @@ def compare(
     }
 
 
-def multi_seed(seeds: list[int] | tuple[int, ...] = (42, 43, 44, 45, 46)) -> dict:
+@contextlib.contextmanager
+def _provider_override(provider: str | None):
+    """Swap NAKAD_LLM_PROVIDER for the duration, restoring it after."""
+    if provider is None:
+        yield
+        return
+    previous = os.environ.get("NAKAD_LLM_PROVIDER")
+    os.environ["NAKAD_LLM_PROVIDER"] = provider
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("NAKAD_LLM_PROVIDER", None)
+        else:
+            os.environ["NAKAD_LLM_PROVIDER"] = previous
+
+
+def _merge_run_configs(configs: list[dict]) -> dict:
+    """Collapse per-seed provenance into one block for the whole sweep."""
+    if not configs:
+        return {}
+    totals: Counter[str] = Counter()
+    for config in configs:
+        totals.update(config["by_method"])
+    return {
+        "provider": configs[0]["provider"],
+        "model": configs[0]["model"],
+        "seeds": len(configs),
+        "events": sum(config["events"] for config in configs),
+        "by_method": dict(sorted(totals.items())),
+        "unknown": sum(config["unknown"] for config in configs),
+        "degraded": any(config["degraded"] for config in configs),
+    }
+
+
+def multi_seed(
+    seeds: list[int] | tuple[int, ...] = (42, 43, 44, 45, 46),
+    provider: str | None = None,
+) -> dict:
     """Rerun both policies on a fresh batch per seed and spread the lift.
 
     One seed cannot distinguish a policy that works from a batch that happened
     to suit it.
+
+    ``provider`` overrides NAKAD_LLM_PROVIDER for these runs only. Five seeds
+    is five times the LLM spend of the headline run and will exhaust a free
+    daily quota, so the stability check can be run with the provider off while
+    the headline run keeps it live. The returned ``run_config`` records which,
+    so the two are never read as one number.
     """
     runs = []
-    with tempfile.TemporaryDirectory() as workspace:
+    configs: list[dict] = []
+    with _provider_override(provider), tempfile.TemporaryDirectory() as workspace:
         for seed in seeds:
             events = generate_batch(seed=seed)
             results = {
@@ -344,6 +391,7 @@ def multi_seed(seeds: list[int] | tuple[int, ...] = (42, 43, 44, 45, 46)) -> dic
                 for policy in POLICIES
             }
             agent, control = results[AGENT], results[CONTROL]
+            configs.append(agent.run_config)
             runs.append(
                 {
                     "seed": seed,
@@ -360,6 +408,7 @@ def multi_seed(seeds: list[int] | tuple[int, ...] = (42, 43, 44, 45, 46)) -> dic
                 }
             )
 
+    config = _merge_run_configs(configs)
     ratios = [run["ratio"] for run in runs if run["ratio"] is not None]
     absolutes = [run["absolute_lift_paise"] for run in runs]
 
@@ -376,6 +425,7 @@ def multi_seed(seeds: list[int] | tuple[int, ...] = (42, 43, 44, 45, 46)) -> dic
         "runs": runs,
         "ratio": spread(ratios),
         "absolute_lift_paise": spread([float(v) for v in absolutes]),
+        "run_config": config,
     }
 
 
@@ -385,6 +435,24 @@ def _rupees(paise: float) -> str:
 
 def _header(title: str) -> None:
     print(f"\n{'=' * 78}\n{title}\n{'=' * 78}")
+
+
+def _print_run_config(config: dict, label: str) -> None:
+    """Print the provenance that every number below it depends on."""
+    if not config:
+        print(f"  {label:<26}(no diagnoses)")
+        return
+    provider = config["provider"]
+    model = config["model"] or "—"
+    mix = ", ".join(f"{name} {count}" for name, count in config["by_method"].items())
+    state = (
+        f"🟠 DEGRADED — {config['unknown']} of {config['events']} undiagnosed"
+        if config["degraded"]
+        else "✅ all events diagnosed"
+    )
+    print(f"  {label:<26}provider {provider}  model {model}")
+    print(f"  {'':<26}{mix or 'nothing diagnosed'}")
+    print(f"  {'':<26}{state}")
 
 
 def _print_diagnosis(report: dict) -> None:
@@ -459,8 +527,10 @@ def _print_reserves(report: dict) -> None:
     )
 
 
-def _print_compare(report: dict) -> None:
+def _print_compare(report: dict, config: dict | None = None) -> None:
     _header("3. AGENT vs CONTROL")
+    if config:
+        _print_run_config(config, "run config")
     agent, control = report["agent_detail"], report["control_detail"]
 
     def row(label: str, left: object, right: object) -> None:
@@ -513,6 +583,9 @@ def _print_compare(report: dict) -> None:
 
 def _print_multi_seed(report: dict) -> None:
     _header("4. STABILITY — the same comparison across seeds")
+    # Printed again here because the sweep may run under a different provider
+    # than the headline: five seeds is five times the LLM spend.
+    _print_run_config(report.get("run_config", {}), "run config")
     print(f"\n  {'seed':<8}{'agent':>14}{'control':>14}{'lift':>14}{'ratio':>9}{'undiag':>9}")
     for run in report["runs"]:
         print(
@@ -543,6 +616,11 @@ if __name__ == "__main__":
 
     events = _load_frozen_batch(frozen_batch)
     diagnoses, _ = diagnose_batch(events)
+    headline_config = run_config(diagnoses)
+
+    _header("0. RUN CONFIG — what produced every number below")
+    _print_run_config(headline_config, "headline run")
+
     _print_diagnosis(diagnosis_report(events, diagnoses))
 
     with tempfile.TemporaryDirectory() as workspace:
@@ -562,6 +640,9 @@ if __name__ == "__main__":
     _print_reserves(reserves)
 
     _print_compare(
-        compare(results[AGENT], results[CONTROL], reserves["ultimate_dispute_rate"])
+        compare(results[AGENT], results[CONTROL], reserves["ultimate_dispute_rate"]),
+        headline_config,
     )
-    _print_multi_seed(multi_seed())
+    # The sweep is five more full runs. Point it at a cheaper provider with
+    # MULTI_SEED_PROVIDER=none when the daily quota will not stretch.
+    _print_multi_seed(multi_seed(provider=os.getenv("MULTI_SEED_PROVIDER") or None))

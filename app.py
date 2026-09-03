@@ -21,7 +21,7 @@ from generator.generate import generate_history
 from ledger import Ledger
 from models import BatchResult
 from pipeline import govern
-from pipeline.diagnose import _load_frozen_batch, diagnose_batch
+from pipeline.diagnose import _load_frozen_batch, diagnose_batch, run_config
 from pipeline.govern import CONTACT_WINDOW, PEAK_RAIL_WINDOWS, to_ist
 from run import AGENT, CONTROL, ENTRY_PROPOSED, POLICIES, TRACE_ENTRY_TYPES, run_batch
 
@@ -45,8 +45,39 @@ STANDING_BADGE = {
 }
 
 
-def build_console(seed: int = 42) -> dict:
-    """Run everything once and write the artifact the console renders."""
+REQUIRED_CONFIG_FIELDS = ("provider", "model", "events", "by_method", "unknown")
+
+
+def write_artifact(artifact: dict, path: Path = ARTIFACT) -> None:
+    """Write the console artifact, refusing one that cannot state its own provenance.
+
+    A shipped artifact is read as the system's performance long after whoever
+    built it has forgotten which provider was configured that afternoon. An
+    artifact that cannot say is worse than no artifact, so this raises rather
+    than writing a file that will be quoted out of context.
+    """
+    for label, config in (
+        ("run_config", artifact.get("run_config")),
+        ("multi_seed.run_config", artifact.get("multi_seed", {}).get("run_config")),
+    ):
+        if not config:
+            raise ValueError(f"refusing to write {path.name}: {label} is missing")
+        missing = [f for f in REQUIRED_CONFIG_FIELDS if config.get(f) in (None, "")]
+        if missing:
+            raise ValueError(
+                f"refusing to write {path.name}: {label} is missing {missing}"
+            )
+    path.write_text(json.dumps(artifact, indent=2, default=str))
+
+
+def build_console(seed: int = 42, multi_seed_provider: str | None = None) -> dict:
+    """Run everything once and write the artifact the console renders.
+
+    ``multi_seed_provider`` runs the five-seed stability sweep under a
+    different provider than the headline run. The sweep is five more full
+    batches and will exhaust a free daily quota; both provider states are
+    recorded separately so the two sections are never read as one.
+    """
     if st.runtime.exists():
         raise RuntimeError(
             "build_console makes LLM calls and must not run in the render path; "
@@ -80,18 +111,19 @@ def build_console(seed: int = 42) -> dict:
         "built_at": datetime.now().isoformat(timespec="seconds"),
         "seed": seed,
         "events": len(events),
-        "provider": os.environ.get("NAKAD_LLM_PROVIDER", "(unset)"),
-        "unknown": results[AGENT].unknown_diagnoses,
+        # Provenance for the headline run. The stability sweep carries its own
+        # under multi_seed, because it may have run under a different provider.
+        "run_config": run_config(diagnoses),
         "fallback_reasons": diagnose_stats.get("fallback_reasons", {}),
         "diagnosis": diagnosis_report(events, diagnoses),
         "reserve": reserves,
         "compare": compare(
             results[AGENT], results[CONTROL], reserves["ultimate_dispute_rate"]
         ),
-        "multi_seed": multi_seed(),
+        "multi_seed": multi_seed(provider=multi_seed_provider),
         "ledgers": {p: results[p].ledger_path for p in POLICIES},
     }
-    ARTIFACT.write_text(json.dumps(artifact, indent=2, default=str))
+    write_artifact(artifact)
     return artifact
 
 
@@ -125,6 +157,14 @@ def _mtime(path: Path | str) -> float:
 
 def _rupees(paise: float | None) -> str:
     return "—" if paise is None else f"₹{paise / 100:,.0f}"
+
+
+def describe_methods(config: dict) -> str:
+    """"rule 313 · fleet 63 · llm 124", or a plain statement of nothing."""
+    mix = config.get("by_method") or {}
+    return " · ".join(f"{name} {count}" for name, count in mix.items()) or (
+        "nothing diagnosed"
+    )
 
 
 def booked_times(ledger_frame: pd.DataFrame) -> pd.DataFrame:
@@ -189,6 +229,16 @@ def tab_scoreboard(console: dict) -> None:
 
     st.divider()
     st.subheader("Lift by seed")
+    sweep = console["multi_seed"]["run_config"]
+    st.caption(
+        f"Sweep provider **{sweep['provider']}** (`{sweep['model'] or '—'}`) · "
+        f"{describe_methods(sweep)} across {sweep['seeds']} seeds · "
+        + (
+            f"🟠 {sweep['unknown']} of {sweep['events']} undiagnosed"
+            if sweep["degraded"]
+            else "✅ all events diagnosed"
+        )
+    )
     runs = pd.DataFrame(console["multi_seed"]["runs"])
     runs["seed"] = runs["seed"].astype(str)
     base = alt.Chart(runs)
@@ -602,10 +652,12 @@ def render() -> None:
     console = load_console(_mtime(ARTIFACT))
     st.title("nakad — recovery under a hard budget")
 
-    degraded = console["unknown"]
+    config = console["run_config"]
+    degraded = config["unknown"]
     identity = (
         f"seed **{console['seed']}** · **{console['events']}** events · "
-        f"provider **{console['provider']}** · built {console['built_at']}"
+        f"provider **{config['provider']}** (`{config['model'] or '—'}`) · "
+        f"{describe_methods(config)} · built {console['built_at']}"
     )
     if degraded:
         share = degraded / console["events"]
@@ -615,6 +667,15 @@ def render() -> None:
         )
     else:
         st.info(f"{identity} · ✅ all events diagnosed")
+
+    sweep = console["multi_seed"]["run_config"]
+    if sweep["provider"] != config["provider"]:
+        st.caption(
+            f"The stability sweep on the Scoreboard tab ran under provider "
+            f"**{sweep['provider']}**, not **{config['provider']}** — five seeds "
+            "is five times the LLM spend. Its spread is not comparable to the "
+            "headline figures above."
+        )
 
     tabs = st.tabs(["Scoreboard", "Compliance", "Ledger", "Diagnosis", "Reserve"])
     with tabs[0]:
@@ -633,9 +694,17 @@ if st.runtime.exists():
     render()
 elif __name__ == "__main__":
     print("building console artifact (this makes the run's LLM calls) …")
-    built = build_console()
-    print(
-        f"wrote {ARTIFACT} — seed {built['seed']}, {built['events']} events, "
-        f"provider {built['provider']}, {built['unknown']} undiagnosed"
-    )
+    # The sweep is five more full batches. Point it at a cheaper provider with
+    # MULTI_SEED_PROVIDER=none when the daily quota will not stretch.
+    built = build_console(multi_seed_provider=os.getenv("MULTI_SEED_PROVIDER") or None)
+    for label, config in (
+        ("headline", built["run_config"]),
+        ("sweep", built["multi_seed"]["run_config"]),
+    ):
+        print(
+            f"  {label:<10}provider {config['provider']} "
+            f"model {config['model'] or '—'} · {describe_methods(config)} · "
+            f"{config['unknown']} undiagnosed"
+        )
+    print(f"wrote {ARTIFACT} — seed {built['seed']}, {built['events']} events")
     print("now run:  streamlit run app.py")

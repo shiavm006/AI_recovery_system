@@ -33,7 +33,7 @@ from pipeline.allocate import (
     index_score,
     recovery_probability,
 )
-from pipeline.diagnose import diagnose_batch
+from pipeline.diagnose import diagnose_batch, run_config
 from pipeline.govern import CONTACT_ACTIONS, GateContext
 
 AGENT = "agent"
@@ -429,6 +429,9 @@ def run_batch(
         unknown_diagnoses=sum(d.cause is RootCause.UNKNOWN for d in diagnoses),
         suppressed_for_no_diagnosis=suppressed_for(SUPPRESSED_FOR_NO_DIAGNOSIS),
         ledger_path=ledger_path,
+        # Control diagnoses nothing by design, so its block is empty rather
+        # than absent — that is the baseline's defining property, not a gap.
+        run_config=run_config(diagnoses),
     )
 
 

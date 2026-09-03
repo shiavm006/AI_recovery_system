@@ -129,6 +129,10 @@ class BatchResult(BaseModel):
     unknown_diagnoses: int
     suppressed_for_no_diagnosis: int
     ledger_path: str
+    # Provider, model and diagnosis-method mix behind these numbers. A run with
+    # the LLM off still returns a plausible gross_recovered_paise, so the state
+    # that produced it travels with the result rather than beside it.
+    run_config: dict
 
 
 class LedgerEntry(BaseModel):

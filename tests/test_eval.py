@@ -74,6 +74,14 @@ def _result(policy: str, **overrides) -> BatchResult:
         unknown_diagnoses=0,
         suppressed_for_no_diagnosis=0,
         ledger_path="/tmp/x.db",
+        run_config={
+            "provider": "openai",
+            "model": "test-model",
+            "events": 0,
+            "by_method": {},
+            "unknown": 0,
+            "degraded": False,
+        },
     )
     return BatchResult(**{**base, **overrides})
 
