@@ -8,14 +8,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
-import urllib.error
-import urllib.request
+import time
 from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
+import requests
 from dotenv import load_dotenv
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
@@ -149,9 +150,33 @@ _KEY_ENV = {
 }
 
 
+DEFAULT_BATCH_DELAY_SECONDS = 2.0
+
+
 def _provider_name() -> str:
     raw = os.getenv("NAKAD_LLM_PROVIDER", "anthropic").strip().lower()
     return raw or "anthropic"
+
+
+def _batch_delay_seconds() -> float:
+    """Pause between sequential LLM batches, so a run paces itself.
+
+    Six back-to-back batches spend a whole minute's token allowance in a few
+    seconds and then sit through the 429 backoff anyway; a small fixed gap is
+    cheaper than the retries it avoids.
+    """
+    raw = os.getenv("LLM_BATCH_DELAY_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_BATCH_DELAY_SECONDS
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        log.warning(
+            "ignoring LLM_BATCH_DELAY_SECONDS=%r, using %.1fs",
+            raw,
+            DEFAULT_BATCH_DELAY_SECONDS,
+        )
+        return DEFAULT_BATCH_DELAY_SECONDS
 
 
 def _key_for(provider: str) -> str:
@@ -343,7 +368,14 @@ def _parse_items(text: str, n: int) -> list[_LlmItem] | None:
     except (json.JSONDecodeError, ValidationError) as exc:
         _note_error(exc)
         return None
-    if len(parsed.items) != n:
+    # Items are positional, so a long response still answers every input in
+    # order and the surplus is discardable. A short one leaves inputs
+    # unanswered, and silently mapping the wrong item onto them would be worse
+    # than UNKNOWN.
+    if len(parsed.items) > n:
+        log.warning("openai returned %d items for %d inputs, truncating", len(parsed.items), n)
+        return parsed.items[:n]
+    if len(parsed.items) < n:
         _note_error(ValueError(f"item count {len(parsed.items)} != {n}"))
         return None
     return parsed.items
@@ -377,40 +409,222 @@ def _call_anthropic(events: list[FailureEvent]) -> list[_LlmItem] | None:
     return _parse_items(text, len(events))
 
 
+OPENAI_MAX_ATTEMPTS = 3
+RATE_LIMIT_DEFAULT_WAIT_SECONDS = 10.0
+# A per-minute 429 clears in seconds; a daily-quota 429 asks for the rest of
+# the day (1435s observed). Waiting that out stalls the whole run for one
+# batch, so past this ceiling we degrade the batch instead of blocking.
+OPENAI_MAX_WAIT_SECONDS = 60.0
+
+# Groq names the delay in the error body: "Please try again in 7.66s", or
+# "in 2m59.56s" once the daily bucket is involved, or "in 500ms".
+_RETRY_AFTER_RE = re.compile(r"try again in\s+(?:(\d+)m)?([\d.]+)(m?s)\b", re.IGNORECASE)
+
+
+def _rate_limit_wait(response: requests.Response) -> float:
+    """Seconds to wait before retrying a 429.
+
+    Prefers the standard Retry-After header and falls back to the delay named
+    in the error body, since Groq sets both. An unparseable body gets a fixed
+    delay rather than a retry storm.
+    """
+    header = response.headers.get("retry-after", "")
+    try:
+        return float(header)
+    except ValueError:
+        pass
+    match = _RETRY_AFTER_RE.search(response.text or "")
+    if match is None:
+        return RATE_LIMIT_DEFAULT_WAIT_SECONDS
+    minutes, value, unit = match.groups()
+    seconds = float(value) / 1000 if unit.lower() == "ms" else float(value)
+    return float(minutes or 0) * 60 + seconds
+
+
 def _call_openai(events: list[FailureEvent]) -> list[_LlmItem] | None:
     key = _key_for("openai")
     if not key:
         _note_error(RuntimeError("no OPENAI_API_KEY"))
         return None
+    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions")
+    try:
+        mode = _openai_structured_mode()
+    except ValueError as exc:
+        _note_error(exc)
+        return None
     body = {
-        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "model": model,
         "temperature": 0,
-        "response_format": {"type": "json_object"},
+        "response_format": _openai_response_format(mode),
         "messages": [
-            {
-                "role": "system",
-                "content": "You output only valid JSON matching the requested schema.",
-            },
+            {"role": "system", "content": _openai_system_prompt(mode)},
             {"role": "user", "content": _classify_prompt(events)},
         ],
     }
-    request = urllib.request.Request(
-        os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions"),
-        data=json.dumps(body).encode(),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {key}",
-        },
-        method="POST",
-    )
+    # requests, not urllib: Cloudflare's browser integrity check rejects the
+    # default Python-urllib user agent with error 1010, and the identical
+    # request through curl or requests returns 200.
+    for attempt in range(1, OPENAI_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.post(
+                url,
+                json=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {key}",
+                },
+                timeout=30,
+            )
+        except requests.RequestException as exc:
+            log.error(
+                "openai request failed: url=%s model=%s mode=%s", url, model, mode
+            )
+            _note_error(exc)
+            return None
+
+        # A 429 on the free tier is a tokens-per-minute ceiling, not a dead
+        # request: waiting the named delay makes the same call succeed. Only
+        # the final attempt is allowed to fall through to the fallback.
+        if response.status_code == 429 and attempt < OPENAI_MAX_ATTEMPTS:
+            wait = _rate_limit_wait(response)
+            if wait > OPENAI_MAX_WAIT_SECONDS:
+                log.error(
+                    "openai rate limited beyond retry ceiling: url=%s model=%s "
+                    "wanted=%.0fs ceiling=%.0fs body=%s",
+                    url,
+                    model,
+                    wait,
+                    OPENAI_MAX_WAIT_SECONDS,
+                    response.text or "(empty)",
+                )
+                _note_error(
+                    RuntimeError(
+                        f"429 rate limited: asked for {wait:.0f}s, above the "
+                        f"{OPENAI_MAX_WAIT_SECONDS:.0f}s retry ceiling"
+                    )
+                )
+                return None
+            log.warning(
+                "openai rate limited: url=%s model=%s attempt=%d/%d waiting=%.2fs",
+                url,
+                model,
+                attempt,
+                OPENAI_MAX_ATTEMPTS,
+                wait,
+            )
+            time.sleep(wait)
+            continue
+        break
+
+    if not response.ok:
+        # The status line alone is useless: 403 Forbidden covers a bad model,
+        # a rate limit, and a rejected parameter. The body is the only way to
+        # tell them apart.
+        response_body = response.text or ""
+        log.error(
+            "openai request failed: url=%s model=%s mode=%s status=%s body=%s",
+            url,
+            model,
+            mode,
+            response.status_code,
+            response_body or "(empty)",
+        )
+        detail = f"{response.status_code} {response.reason}"
+        if response_body:
+            detail = f"{detail}: {response_body}"
+        _note_error(RuntimeError(detail))
+        return None
+
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = json.loads(response.read().decode())
-        content = payload["choices"][0]["message"]["content"]
-    except Exception as exc:
+        content = response.json()["choices"][0]["message"]["content"]
+    except (ValueError, KeyError, IndexError, TypeError) as exc:
+        log.error("openai request failed: url=%s model=%s mode=%s", url, model, mode)
         _note_error(exc)
         return None
+    # Same Pydantic validation either mode: an invalid cause or malformed
+    # shape falls through to UNKNOWN via the shared fallback path.
     return _parse_items(content, len(events))
+
+
+# Groq's OpenAI-compatible endpoint rejects json_schema; OpenAI accepts both.
+# The mode only changes how the shape is requested — response validation and
+# the RootCause enum constraint are identical either way.
+OPENAI_STRUCTURED_JSON_SCHEMA = "json_schema"
+OPENAI_STRUCTURED_JSON_OBJECT = "json_object"
+OPENAI_STRUCTURED_MODES = frozenset(
+    {OPENAI_STRUCTURED_JSON_SCHEMA, OPENAI_STRUCTURED_JSON_OBJECT}
+)
+
+
+def _openai_structured_mode() -> str:
+    mode = os.getenv("OPENAI_STRUCTURED_MODE", OPENAI_STRUCTURED_JSON_SCHEMA).strip().lower()
+    if mode not in OPENAI_STRUCTURED_MODES:
+        raise ValueError(
+            f"OPENAI_STRUCTURED_MODE must be one of "
+            f"{sorted(OPENAI_STRUCTURED_MODES)}, got {mode!r}"
+        )
+    return mode
+
+
+def _openai_json_schema() -> dict:
+    """Strict schema whose cause enum matches CLASSIFIABLE_CAUSES.
+
+    Built by hand rather than from ``_LlmResponse.model_json_schema()`` so
+    UNKNOWN is not offered — that enum member exists for fallbacks, not as a
+    classifier verdict.
+    """
+    causes = [cause.value for cause in CLASSIFIABLE_CAUSES]
+    return {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "cause": {"type": "string", "enum": causes},
+                        "confidence": {"type": "number"},
+                        "evidence": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["cause", "confidence", "evidence"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+
+
+def _openai_response_format(mode: str) -> dict:
+    if mode == OPENAI_STRUCTURED_JSON_OBJECT:
+        return {"type": "json_object"}
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "root_cause_batch",
+            "strict": True,
+            "schema": _openai_json_schema(),
+        },
+    }
+
+
+def _openai_system_prompt(mode: str) -> str:
+    causes = ", ".join(cause.value for cause in CLASSIFIABLE_CAUSES)
+    shape = (
+        '{"items":[{"cause":"<RootCause>","confidence":0.0,"evidence":["..."]}]} '
+        f"where cause is one of [{causes}], confidence is in [0,1], "
+        "and items has one entry per input in the same order."
+    )
+    if mode == OPENAI_STRUCTURED_JSON_OBJECT:
+        # Groq only guarantees JSON object shape; the enum constraint has to
+        # live in the prompt and is re-enforced by Pydantic after the call.
+        return f"You output only valid JSON matching this exact shape: {shape}"
+    return "You output only valid JSON matching the requested schema."
 
 
 def _close_gemini_client() -> None:
@@ -542,8 +756,11 @@ def diagnose_by_llm(events: list[FailureEvent]) -> list[Diagnosis]:
             continue
         uncached.append(key)
 
+    batch_delay = _batch_delay_seconds()
     try:
         for offset in range(0, len(uncached), 20):
+            if offset and batch_delay:
+                time.sleep(batch_delay)
             batch_keys = uncached[offset : offset + 20]
             _stats["llm_calls"] += 1
             reps = [events[by_key[key][0]] for key in batch_keys]

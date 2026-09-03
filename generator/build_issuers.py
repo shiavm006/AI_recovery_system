@@ -16,9 +16,6 @@ SOURCE_URL = "https://dataful.in/datasets/336/"
 
 PRODUCTS: tuple[str, ...] = ("NFS",)
 TOP_N = 8
-
-# approved + business declined + technical declined should account for every
-# transaction. Rows that do not close are excluded with a warning.
 CLOSURE_TOLERANCE_PCT = 1.0
 
 
