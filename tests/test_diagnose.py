@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +11,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models import FailureEvent, RootCause
 from pipeline import diagnose as diagnose_mod
-from pipeline.diagnose import _LlmItem, _LlmResponse, diagnose_batch
+from pipeline.diagnose import (
+    PSP_ISSUER_PREFIX,
+    UNKNOWN_ISSUER,
+    _LlmItem,
+    _LlmResponse,
+    detect_outages,
+    diagnose_batch,
+    diagnose_by_rule,
+)
 
 
 def _event(**kw) -> FailureEvent:
@@ -34,6 +42,175 @@ def _event(**kw) -> FailureEvent:
     )
     defaults.update(kw)
     return FailureEvent(**defaults)
+
+
+def _technical_cluster(issuer: str, n: int = 10) -> list[FailureEvent]:
+    """n technical failures on one issuer inside a 15-minute window."""
+    base = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    return [
+        _event(
+            event_id=f"e{i}",
+            payment_id=f"p{i}",
+            issuer=issuer,
+            error_reason="bank_technical_error",
+            occurred_at=base,
+        )
+        for i in range(n)
+    ]
+
+
+def test_ten_unknown_issuers_produce_no_outage():
+    # Missing identity must not become a confident finding. Without this
+    # exclusion every unparseable webhook pools into one bucket, passes the
+    # 70% concentration test at 100%, and is diagnosed ISSUER_DOWNTIME at 0.95.
+    events = _technical_cluster(UNKNOWN_ISSUER, n=10)
+    report = detect_outages(events)
+
+    assert report.outages == {}
+    # Fall through to the rule path (bank_technical_error → ISSUER_DOWNTIME),
+    # never the fleet correlation that invented the outage from thin air.
+    for event in events:
+        diagnosis = diagnose_by_rule(event, report)
+        assert diagnosis is not None
+        assert diagnosis.method == "rule"
+
+
+def test_a_psp_derived_identity_does_not_trigger_bank_outage_correlation():
+    # user@ybl yields psp:ybl — PhonePe's handle, not an issuing bank.
+    # Correlating on it groups by the payer's app and mixes every bank behind
+    # one PSP into a single false outage.
+    events = _technical_cluster(f"{PSP_ISSUER_PREFIX}ybl", n=10)
+    report = detect_outages(events)
+
+    assert report.outages == {}
+    for event in events:
+        diagnosis = diagnose_by_rule(event, report)
+        assert diagnosis is not None
+        assert diagnosis.method == "rule"
+
+
+def test_a_real_bank_cluster_still_flags_an_outage():
+    events = _technical_cluster("hdfc", n=10)
+    report = detect_outages(events)
+
+    assert "hdfc" in report.outages
+    assert report.correlation_possible
+    for event in events:
+        diagnosis = diagnose_by_rule(event, report)
+        assert diagnosis is not None
+        assert diagnosis.cause is RootCause.ISSUER_DOWNTIME
+        assert diagnosis.method == "fleet"
+
+
+def test_a_high_volume_issuer_at_normal_failure_rate_does_not_fire():
+    # Nine timeouts among hundreds of failures on a bank that is most of our
+    # volume: concentration alone would trip, but the mix matches the baseline.
+    base = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    baseline = 0.10
+    events = [
+        _event(
+            event_id=f"tech{i}",
+            payment_id=f"tech{i}",
+            issuer="hdfc",
+            error_reason="bank_technical_error",
+            occurred_at=base,
+            issuer_recent_failure_rate=baseline,
+        )
+        for i in range(9)
+    ] + [
+        _event(
+            event_id=f"biz{i}",
+            payment_id=f"biz{i}",
+            issuer="hdfc",
+            error_reason="insufficient_funds",
+            occurred_at=base,
+            issuer_recent_failure_rate=baseline,
+        )
+        for i in range(81)  # 9/90 = 0.10, exactly the baseline — not elevated
+    ]
+    report = detect_outages(events)
+
+    assert report.correlation_possible  # denser than min_events
+    assert report.outages == {}
+
+
+def test_the_same_issuer_at_elevated_rate_does_fire():
+    base = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    baseline = 0.10
+    events = [
+        _event(
+            event_id=f"tech{i}",
+            payment_id=f"tech{i}",
+            issuer="hdfc",
+            error_reason="bank_technical_error",
+            occurred_at=base,
+            issuer_recent_failure_rate=baseline,
+        )
+        for i in range(9)
+    ] + [
+        _event(
+            event_id="biz0",
+            payment_id="biz0",
+            issuer="hdfc",
+            error_reason="insufficient_funds",
+            occurred_at=base,
+            issuer_recent_failure_rate=baseline,
+        )
+    ]  # 9/10 = 0.90 >= 0.10 * 3
+    report = detect_outages(events)
+
+    assert "hdfc" in report.outages
+
+
+def test_sixty_failures_over_four_hours_are_out_of_scope():
+    # The detector only sees bursts inside OUTAGE_WINDOW_MINUTES. A slow drip
+    # never co-occurs in one window — documented as out of scope, not missed.
+    start = datetime(2026, 9, 1, 8, 0, tzinfo=timezone.utc)
+    events = [
+        _event(
+            event_id=f"e{i}",
+            payment_id=f"p{i}",
+            issuer="hdfc",
+            error_reason="bank_technical_error",
+            occurred_at=start + timedelta(minutes=i * 4),  # 60 × 4min = 4h
+            issuer_recent_failure_rate=0.05,
+        )
+        for i in range(60)
+    ]
+    report = detect_outages(events)
+
+    assert report.outages == {}
+    assert report.correlation_possible is False
+    assert "out of scope" in report.insufficient_evidence()
+
+
+def test_own_re_presentations_are_excluded_from_correlation():
+    # A retry storm we caused looks exactly like an issuer outage if counted.
+    events = [
+        _event(
+            event_id=f"e{i}",
+            payment_id=f"p{i}",
+            issuer="hdfc",
+            error_reason="bank_technical_error",
+            occurred_at=datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc),
+            retries_used=1,
+            issuer_recent_failure_rate=0.05,
+        )
+        for i in range(10)
+    ]
+    report = detect_outages(events)
+
+    assert report.outages == {}
+    assert report.correlation_possible is False
+
+
+def test_a_single_event_records_that_fleet_correlation_was_skipped(monkeypatch):
+    monkeypatch.setenv("NAKAD_LLM_PROVIDER", "none")
+    diagnoses, _ = diagnose_batch([_event(error_reason="payment_failed")])
+
+    assert any(
+        "fleet_correlation=skipped" in line for line in diagnoses[0].evidence
+    )
 
 
 def _stub_gemini(monkeypatch, generate_content):

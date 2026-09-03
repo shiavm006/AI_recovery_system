@@ -16,6 +16,17 @@ decision is worth nothing unless the budget persists between requests, so the
 remaining allowance and the per-mandate attempt count both live in
 ``LiveBudget``, in the same database file as the ledger. See allocate.py's
 module docstring.
+
+Fleet outage correlation also needs more than one event. Each webhook is
+recorded into ``RecentFailures`` and diagnosed against the last
+``OUTAGE_WINDOW_MINUTES`` of traffic; without that buffer the layer pitched as
+requiring batch context silently never fires in production.
+
+Bank identity is resolved from a vendored copy of Razorpay's IFSC bank-code
+map (``data/reference/ifsc-banknames.json``), never from ifsc.razorpay.com at
+runtime. The dataset is Razorpay's own, MIT-licensed code with a public-domain
+dataset, sourced from RBI NEFT/RTGS lists and the NPCI ACH live-banks list —
+see ``data/reference/ifsc-banknames.SOURCE.txt``.
 """
 
 from __future__ import annotations
@@ -47,7 +58,12 @@ from pipeline.allocate import (
     budget_pool,
     index_score,
 )
-from pipeline.diagnose import diagnose_batch
+from pipeline.diagnose import (
+    OUTAGE_WINDOW_MINUTES,
+    PSP_ISSUER_PREFIX,
+    UNKNOWN_ISSUER,
+    diagnose_batch,
+)
 from pipeline.govern import RAIL_ACTIONS, to_ist
 from run import (
     ENTRY_DIAGNOSED,
@@ -75,7 +91,68 @@ DEFAULT_DAYS_SINCE_MANDATE = 45
 DEFAULT_ISSUER_FAILURE_RATE = 0.05
 DEFAULT_AMOUNT_VS_AVG = 1.0
 DEFAULT_RETRIES_USED = 0
-DEFAULT_ISSUER = "unknown"
+DEFAULT_ISSUER = UNKNOWN_ISSUER
+
+BANKNAMES_PATH = _ROOT / "data" / "reference" / "ifsc-banknames.json"
+
+# Bank-issued VPA handles where the handle itself names the issuing bank,
+# mapped to the IFSC four-character bank code. PSP handles (ybl, paytm, axl, …)
+# are deliberately absent: those name the payer's app.
+BANK_VPA_HANDLES = {
+    "oksbi": "SBIN",
+    "okhdfcbank": "HDFC",
+    "okicici": "ICIC",
+    "okaxis": "UTIB",
+}
+
+_banknames: dict[str, str] | None = None
+
+
+def _load_banknames() -> dict[str, str]:
+    """Load the vendored IFSC bank-code → name map. No network."""
+    global _banknames
+    if _banknames is None:
+        _banknames = json.loads(BANKNAMES_PATH.read_text())
+    return _banknames
+
+
+def bank_name(code: str) -> str | None:
+    """Resolve a four-character IFSC bank code to its name, or None if unknown."""
+    return _load_banknames().get(code.upper())
+
+
+def _ifsc_from_payment(payment: dict[str, Any]) -> str | None:
+    """Pull a raw IFSC string out of the payment entity, if present."""
+    for key in ("ifsc", "bank_ifsc"):
+        value = payment.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    account = payment.get("bank_account")
+    if isinstance(account, dict):
+        value = account.get("ifsc")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    notes = payment.get("notes")
+    if isinstance(notes, dict):
+        value = notes.get("ifsc") or notes.get("bank_ifsc")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _resolve_ifsc(raw: str) -> tuple[str, str] | None:
+    """Return (bank_code, bank_name) from an IFSC, or None if the code is unknown.
+
+    Does not raise on an unknown prefix — the caller falls through to the next
+    identity path instead of failing the webhook.
+    """
+    code = raw.strip().upper()[:4]
+    if len(code) < 4 or not code.isalpha():
+        return None
+    name = bank_name(code)
+    if name is None:
+        return None
+    return code, name
 
 METHOD_MAP = {
     "upi": "upi_autopay",
@@ -112,6 +189,7 @@ _live_feed: deque[LiveRecord] = deque(maxlen=20)
 _ledger: Ledger | None = None
 _seen: SeenEvents | None = None
 _budget: LiveBudget | None = None
+_recent: RecentFailures | None = None
 
 
 class LiveRecord(BaseModel):
@@ -317,14 +395,83 @@ class LiveBudget:
         self._conn.close()
 
 
+class RecentFailures:
+    """Rolling window of live failures for fleet outage correlation.
+
+    ``diagnose_batch([event])`` can never trip ``min_events=8``, so without a
+    buffer the layer pitched as requiring batch context does not exist in
+    production. Each webhook is correlated against the last
+    ``OUTAGE_WINDOW_MINUTES`` of traffic stored here, in the same SQLite file
+    as the ledger.
+    """
+
+    def __init__(self, db_path: str) -> None:
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(
+            db_path, isolation_level=None, check_same_thread=False
+        )
+        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recent_failures (
+              event_id TEXT PRIMARY KEY,
+              occurred_at TEXT NOT NULL,
+              payload TEXT NOT NULL
+            )
+            """
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS recent_failures_occurred_at "
+            "ON recent_failures (occurred_at)"
+        )
+
+    def record(self, event: FailureEvent) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO recent_failures "
+            "(event_id, occurred_at, payload) VALUES (?, ?, ?)",
+            (
+                event.event_id,
+                event.occurred_at.isoformat(),
+                event.model_dump_json(),
+            ),
+        )
+        self.prune()
+
+    def recent(
+        self, window_minutes: int = OUTAGE_WINDOW_MINUTES
+    ) -> list[FailureEvent]:
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+        ).isoformat()
+        rows = self._conn.execute(
+            "SELECT payload FROM recent_failures WHERE occurred_at >= ? "
+            "ORDER BY occurred_at",
+            (cutoff,),
+        ).fetchall()
+        return [FailureEvent.model_validate_json(row[0]) for row in rows]
+
+    def prune(self, window_minutes: int = OUTAGE_WINDOW_MINUTES) -> int:
+        # Keep a little past the window so a clock skew at the edge does not
+        # drop the event that just arrived.
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(minutes=window_minutes * 2)
+        ).isoformat()
+        return self._conn.execute(
+            "DELETE FROM recent_failures WHERE occurred_at < ?", (cutoff,)
+        ).rowcount
+
+    def close(self) -> None:
+        self._conn.close()
+
+
 def reset_live_state() -> None:
     """Drop cached handles and the feed. For tests only.
 
-    Does not delete the dedupe or budget tables: surviving a restart is the
-    point, and a test that wants a clean slate should point LIVE_LEDGER_PATH at
-    a new file.
+    Does not delete the dedupe, budget, or recent-failure tables: surviving a
+    restart is the point, and a test that wants a clean slate should point
+    LIVE_LEDGER_PATH at a new file.
     """
-    global _ledger, _seen, _budget
+    global _ledger, _seen, _budget, _recent
     _live_feed.clear()
     _ledger = None
     if _seen is not None:
@@ -333,6 +480,9 @@ def reset_live_state() -> None:
     if _budget is not None:
         _budget.close()
     _budget = None
+    if _recent is not None:
+        _recent.close()
+    _recent = None
 
 
 def _ledger_instance() -> Ledger:
@@ -355,6 +505,13 @@ def _live_budget() -> LiveBudget:
     if _budget is None:
         _budget = LiveBudget(LIVE_LEDGER_PATH)
     return _budget
+
+
+def _recent_failures() -> RecentFailures:
+    global _recent
+    if _recent is None:
+        _recent = RecentFailures(LIVE_LEDGER_PATH)
+    return _recent
 
 
 def verify_webhook_signature(raw_body: bytes, signature: str, secret: str) -> None:
@@ -396,25 +553,55 @@ def _map_method(raw: str | None, provenance: dict[str, str]) -> str:
 
 
 def _map_issuer(payment: dict[str, Any], provenance: dict[str, str]) -> str:
+    """Resolve issuing-bank identity for outage correlation.
+
+    Order: IFSC (vendored bank-code map) → unambiguous bank VPA handle →
+    PSP-tagged VPA handle → unknown. Each path records the raw input in
+    provenance. An unknown IFSC prefix falls through rather than raising.
+    """
+    prior: str | None = None
+    raw_ifsc = _ifsc_from_payment(payment)
+    if raw_ifsc is not None:
+        resolved = _resolve_ifsc(raw_ifsc)
+        if resolved is not None:
+            code, name = resolved
+            provenance["issuer"] = (
+                f"IFSC {raw_ifsc!r} → bank code {code} ({name}) "
+                f"via vendored ifsc-banknames.json"
+            )
+            return code
+        prior = (
+            f"IFSC {raw_ifsc!r} has unknown bank code "
+            f"{raw_ifsc.strip().upper()[:4]!r}; falling through"
+        )
+
+    def note(message: str) -> None:
+        provenance["issuer"] = f"{prior}; {message}" if prior else message
+
     vpa = payment.get("vpa")
     if isinstance(vpa, str) and "@" in vpa:
-        return vpa.split("@", 1)[1]
-    bank = payment.get("bank")
-    if isinstance(bank, str) and bank:
-        return bank.lower()
-    card = payment.get("card")
-    if isinstance(card, dict):
-        issuer = card.get("issuer") or card.get("network")
-        if isinstance(issuer, str) and issuer:
-            return issuer.lower()
-    notes = payment.get("notes")
-    if isinstance(notes, dict):
-        issuer = notes.get("issuer") or notes.get("issuer_bank")
-        if isinstance(issuer, str) and issuer:
-            return issuer.lower()
-    provenance["issuer"] = (
-        "not present on payment entity (no vpa/bank/card issuer); "
-        f"default {DEFAULT_ISSUER!r}"
+        handle = vpa.split("@", 1)[1].strip().lower()
+        if handle in BANK_VPA_HANDLES:
+            code = BANK_VPA_HANDLES[handle]
+            name = bank_name(code) or code
+            note(
+                f"VPA handle {handle!r} (from {vpa!r}) maps unambiguously to "
+                f"bank code {code} ({name})"
+            )
+            return code
+        # A PSP handle names the payer's app (PhonePe, Paytm, …), not the
+        # issuing bank. Storing it as psp:… keeps the handle visible for the
+        # LLM while keeping detect_outages from correlating on it.
+        tagged = f"{PSP_ISSUER_PREFIX}{handle}"
+        note(
+            f"VPA handle {handle!r} (from {vpa!r}) is a PSP, not an issuing bank; "
+            f"stored as {tagged!r} and excluded from bank-outage correlation"
+        )
+        return tagged
+
+    note(
+        f"no IFSC or VPA on payment entity; default {DEFAULT_ISSUER!r} — "
+        "excluded from bank-outage correlation"
     )
     return DEFAULT_ISSUER
 
@@ -611,7 +798,11 @@ def process_failure_event(
                     claimed,
                 )
 
-        diagnoses, _ = diagnose_batch([event])
+        # Correlate against recent live traffic, not against this event alone —
+        # min_events is 8 and a single webhook can never trip the fleet layer.
+        buffer = _recent_failures()
+        buffer.record(event)
+        diagnoses, _ = diagnose_batch([event], correlation_events=buffer.recent())
         diagnosis = diagnoses[0]
         # Remaining budget, not the full allowance: see allocate's module
         # docstring on why one event against a fresh pool decides nothing.

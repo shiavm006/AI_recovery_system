@@ -12,7 +12,9 @@ from pipeline.diagnose import _cache_key, _sig, diagnose_by_rule, detect_outages
 
 def test_ambiguous_features_correlate_without_separating():
     batch = generate_batch(n=500, seed=42)
-    leftover = [e for e in batch if diagnose_by_rule(e, detect_outages(batch)) is None]
+    leftover = [
+        e for e in batch if diagnose_by_rule(e, detect_outages(batch)) is None
+    ]
     assert len({_sig(e) for e in leftover}) > 50
     assert len({_cache_key(e) for e in leftover}) < len({_sig(e) for e in leftover})
 

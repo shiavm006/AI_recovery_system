@@ -61,6 +61,25 @@ RULE_BY_REASON: dict[str, RootCause] = {
 
 _outage_counts: dict[str, int] = {}
 _cache: dict[CacheKey, tuple[RootCause, float, list[str]]] = {}
+
+# Issuer values that cannot support bank-outage correlation. "unknown" is a
+# missing identity; "psp:…" is a payer-app handle from a VPA, not a bank.
+UNKNOWN_ISSUER = "unknown"
+PSP_ISSUER_PREFIX = "psp:"
+
+# Sliding window and absolute-cluster floor for fleet outage detection.
+OUTAGE_WINDOW_MINUTES = 15
+OUTAGE_MIN_EVENTS = 8
+OUTAGE_CONCENTRATION = 0.7
+# CHOSEN, not derived: how far above the issuer's own recent technical rate
+# the in-window mix must climb before concentration alone is enough. Without
+# this, a bank that is 35% of volume trips the detector at its normal failure
+# rate whenever nine of its timeouts land in one window. 3× is a round number
+# that clears the generator's normal-rate noise and still catches the outage
+# windows the simulator plants; replace with a calibrated multiple from
+# production baselines when those exist.
+OUTAGE_ELEVATION_FACTOR = 3.0
+
 _stats: dict = {
     "llm_calls": 0,
     "cache_hits": 0,
@@ -70,6 +89,28 @@ _stats: dict = {
     "unique_cache_keys": 0,
     "fallback_reasons": Counter(),
 }
+
+
+def _is_bank_issuer(issuer: str) -> bool:
+    """Whether ``issuer`` names an issuing bank we can correlate on."""
+    return bool(issuer) and issuer != UNKNOWN_ISSUER and not issuer.startswith(
+        PSP_ISSUER_PREFIX
+    )
+
+
+def _is_correlatable(event: FailureEvent) -> bool:
+    """Whether this failure may enter the outage-correlation input.
+
+    Re-presentations (``retries_used > 0``) are excluded: a retry storm we
+    caused produces exactly the technical-cluster signature the detector
+    reads as an issuer outage. The field does not distinguish our retries
+    from the merchant's, so both are dropped — safer than treating a storm
+    we started as evidence the bank is down.
+    """
+    return (
+        _is_bank_issuer(event.issuer)
+        and event.retries_used == 0
+    )
 _gemini_client = None
 # The most recent provider failure, so a fallback can name the actual cause
 # rather than the category it fell into.
@@ -241,44 +282,126 @@ class LlmProvider(Protocol):
     def __call__(self, events: list[FailureEvent]) -> list[_LlmItem] | None: ...
 
 
+class OutageReport:
+    """Result of one fleet pass over a set of failures.
+
+    ``correlation_possible`` is True when at least one sliding window held
+    enough correlatable technical failures to run the concentration test.
+    False means the layer had nothing to work with — a single live event, or
+    sixty dripped across four hours — and callers must say so in evidence
+    rather than silently omitting the layer.
+    """
+
+    __slots__ = ("outages", "correlation_possible", "window_minutes", "min_events")
+
+    def __init__(
+        self,
+        outages: dict[str, tuple[datetime, datetime]],
+        correlation_possible: bool,
+        window_minutes: int = OUTAGE_WINDOW_MINUTES,
+        min_events: int = OUTAGE_MIN_EVENTS,
+    ) -> None:
+        self.outages = outages
+        self.correlation_possible = correlation_possible
+        self.window_minutes = window_minutes
+        self.min_events = min_events
+
+    def insufficient_evidence(self) -> str:
+        return (
+            f"fleet_correlation=skipped: fewer than {self.min_events} correlatable "
+            f"technical failures in any {self.window_minutes}-minute window "
+            f"(slow drips outside that horizon are out of scope)"
+        )
+
+
+def _issuer_elevated(
+    issuer: str,
+    window_events: list[FailureEvent],
+    elevation_factor: float,
+) -> bool:
+    """Whether this issuer's in-window mix is above its own recent baseline.
+
+    Among the issuer's failures in the window, the technical share is compared
+    to the mean of ``issuer_recent_failure_rate`` on those same events. The
+    batch only contains failures, so this is a mix shift, not a volume rate —
+    exactly the signal that separates "bank is 35% of traffic" from "bank is
+    suddenly all timeouts."
+    """
+    theirs = [event for event in window_events if event.issuer == issuer]
+    if not theirs:
+        return False
+    tech = sum(1 for event in theirs if _is_technical(event))
+    observed = tech / len(theirs)
+    baseline = sum(event.issuer_recent_failure_rate for event in theirs) / len(theirs)
+    return observed >= baseline * elevation_factor
+
+
 def detect_outages(
     events: list[FailureEvent],
-    window_minutes: int = 15,
-    min_events: int = 8,
-    concentration: float = 0.7,
-) -> dict[str, tuple[datetime, datetime]]:
-    """Flag issuer outages from the whole batch before any per-event diagnosis.
+    window_minutes: int = OUTAGE_WINDOW_MINUTES,
+    min_events: int = OUTAGE_MIN_EVENTS,
+    concentration: float = OUTAGE_CONCENTRATION,
+    elevation_factor: float = OUTAGE_ELEVATION_FACTOR,
+) -> OutageReport:
+    """Flag issuer outages from a set of failures before per-event diagnosis.
 
     A single timeout looks like a customer problem. Only a cluster of
     technical-flavoured failures on one issuer, across distinct payment_ids,
-    reveals a bank outage. That correlation does not exist until the batch
-    is seen together, so this must run once over every event first.
+    reveals a bank outage. That correlation does not exist until enough
+    events are seen together — a batch, or a live buffer of recent traffic.
+
+    Two gates, both required:
+
+    * Absolute concentration: the dominant issuer owns at least
+      ``concentration`` of the technical failures in the window.
+    * Elevation: that issuer's in-window technical mix is at least
+      ``elevation_factor`` times its own ``issuer_recent_failure_rate``.
+      Concentration alone fires on high-volume banks at their normal rate.
+
+    Scope: only bursts inside ``window_minutes``. Sixty failures dripped
+    evenly over four hours never co-occur in one window and are out of
+    scope — ``correlation_possible`` will be False and the caller must say
+    so, not pretend the layer ran.
+
+    Events whose issuer is missing (``unknown``) or a PSP handle (``psp:…``),
+    and events with ``retries_used > 0`` (re-presentations), are excluded
+    from the correlation input.
     """
     global _outage_counts
     _outage_counts = {}
+    empty = OutageReport({}, False, window_minutes, min_events)
     if not events:
-        return {}
+        return empty
 
     ordered = sorted(events, key=lambda event: event.occurred_at)
     found: dict[str, tuple[datetime, datetime]] = {}
     right = 0
     n = len(ordered)
     delta = timedelta(minutes=window_minutes)
+    any_dense_window = False
 
     for left in range(n):
         limit = ordered[left].occurred_at + delta
         while right < n and ordered[right].occurred_at <= limit:
             right += 1
+        window_events = ordered[left:right]
         by_payment: dict[str, FailureEvent] = {}
-        for event in ordered[left:right]:
-            if _is_technical(event) and event.payment_id not in by_payment:
+        for event in window_events:
+            if (
+                _is_technical(event)
+                and _is_correlatable(event)
+                and event.payment_id not in by_payment
+            ):
                 by_payment[event.payment_id] = event
         cluster = list(by_payment.values())
         if len(cluster) < min_events:
             continue
+        any_dense_window = True
         counts = Counter(event.issuer for event in cluster)
         issuer, top = counts.most_common(1)[0]
         if top / len(cluster) < concentration:
+            continue
+        if not _issuer_elevated(issuer, window_events, elevation_factor):
             continue
         issuer_events = [event for event in cluster if event.issuer == issuer]
         start = min(event.occurred_at for event in issuer_events)
@@ -291,29 +414,33 @@ def detect_outages(
         found[issuer] = (start, end)
         _outage_counts[issuer] = top
 
-    return found
+    return OutageReport(found, any_dense_window, window_minutes, min_events)
 
 
 def diagnose_by_rule(
     event: FailureEvent,
-    outages: dict[str, tuple[datetime, datetime]],
+    outages: dict[str, tuple[datetime, datetime]] | OutageReport,
 ) -> Diagnosis | None:
-    window = outages.get(event.issuer)
-    if window is not None:
-        start, end = window
-        if start <= event.occurred_at <= end:
-            count = _outage_counts.get(event.issuer, 0)
-            return Diagnosis(
-                event_id=event.event_id,
-                cause=RootCause.ISSUER_DOWNTIME,
-                confidence=0.95,
-                evidence=[
-                    f"issuer={event.issuer}",
-                    f"window={start.isoformat()}..{end.isoformat()}",
-                    f"correlated_failures={count}",
-                ],
-                method="fleet",
-            )
+    windows = outages.outages if isinstance(outages, OutageReport) else outages
+    # Belt-and-braces: even if an old outage map somehow named a non-bank
+    # issuer, do not promote a missing identity into a confident finding.
+    if _is_bank_issuer(event.issuer):
+        window = windows.get(event.issuer)
+        if window is not None:
+            start, end = window
+            if start <= event.occurred_at <= end:
+                count = _outage_counts.get(event.issuer, 0)
+                return Diagnosis(
+                    event_id=event.event_id,
+                    cause=RootCause.ISSUER_DOWNTIME,
+                    confidence=0.95,
+                    evidence=[
+                        f"issuer={event.issuer}",
+                        f"window={start.isoformat()}..{end.isoformat()}",
+                        f"correlated_failures={count}",
+                    ],
+                    method="fleet",
+                )
 
     cause = RULE_BY_REASON.get(event.error_reason)
     if cause is None:
@@ -328,6 +455,15 @@ def diagnose_by_rule(
             f"error_code={event.error_code}",
         ],
         method="rule",
+    )
+
+
+def _with_fleet_note(diagnosis: Diagnosis, report: OutageReport) -> Diagnosis:
+    """Attach an explicit skip reason when the fleet layer had nothing to work with."""
+    if report.correlation_possible or diagnosis.method == "fleet":
+        return diagnosis
+    return diagnosis.model_copy(
+        update={"evidence": list(diagnosis.evidence) + [report.insufficient_evidence()]}
     )
 
 
@@ -837,7 +973,16 @@ def diagnose_by_llm(events: list[FailureEvent]) -> list[Diagnosis]:
     ]
 
 
-def diagnose_batch(events: list[FailureEvent]) -> tuple[list[Diagnosis], dict]:
+def diagnose_batch(
+    events: list[FailureEvent],
+    correlation_events: list[FailureEvent] | None = None,
+) -> tuple[list[Diagnosis], dict]:
+    """Diagnose ``events``, correlating outages over ``correlation_events``.
+
+    ``correlation_events`` defaults to ``events``. The live path passes a
+    rolling buffer of recent traffic so a single webhook is not correlated
+    against itself alone — ``min_events`` is 8 and one event can never trip it.
+    """
     global _cache
     _cache = {}
     _stats["llm_calls"] = 0
@@ -851,19 +996,21 @@ def diagnose_batch(events: list[FailureEvent]) -> tuple[list[Diagnosis], dict]:
     name = _provider_name()
     log.info("LLM provider selected: %s; key found: %s", name, bool(_key_for(name)))
 
-    outages = detect_outages(events)
+    report = detect_outages(
+        correlation_events if correlation_events is not None else events
+    )
     diagnoses: list[Diagnosis | None] = [None] * len(events)
     leftover_idx: list[int] = []
     for index, event in enumerate(events):
-        result = diagnose_by_rule(event, outages)
+        result = diagnose_by_rule(event, report)
         if result is None:
             leftover_idx.append(index)
         else:
-            diagnoses[index] = result
+            diagnoses[index] = _with_fleet_note(result, report)
 
     leftover = diagnose_by_llm([events[index] for index in leftover_idx])
     for index, result in zip(leftover_idx, leftover):
-        diagnoses[index] = result
+        diagnoses[index] = _with_fleet_note(result, report)
 
     filled = [item for item in diagnoses if item is not None]
     if _stats["fallbacks"]:
@@ -888,6 +1035,8 @@ def diagnose_batch(events: list[FailureEvent]) -> tuple[list[Diagnosis], dict]:
         "unique_cache_keys": _stats["unique_cache_keys"],
         "llm_errors": list(_stats["llm_errors"]),
         "fallback_reasons": dict(_stats["fallback_reasons"]),
+        "fleet_correlation_possible": report.correlation_possible,
+        "fleet_outages": sorted(report.outages),
     }
     return filled, stats
 
@@ -908,8 +1057,10 @@ def _load_frozen_batch(path: Path) -> list[FailureEvent]:
 
 def _print_ambiguous_true_cause(events: list[FailureEvent]) -> None:
     """Grading-only dump. diagnose_batch must not call this."""
-    outages = detect_outages(events)
-    leftover = [event for event in events if diagnose_by_rule(event, outages) is None]
+    report = detect_outages(events)
+    leftover = [
+        event for event in events if diagnose_by_rule(event, report) is None
+    ]
     groups: dict[Sig, Counter[str]] = {}
     order: list[Sig] = []
     for event in leftover:

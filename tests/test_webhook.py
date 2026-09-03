@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import webhook
 from ledger import Ledger
-from models import Diagnosis, RootCause
+from models import Diagnosis, FailureEvent, RootCause
 from pipeline.allocate import (
     CONTACT_POOL,
     DEFAULT_RETRY_BUDGET,
@@ -26,7 +26,7 @@ from pipeline.allocate import (
     SUPPRESSED_FOR_NO_HEADROOM,
     recovery_probability,
 )
-from pipeline.govern import IST, NPCI_RETRY_CAP
+from pipeline.govern import IST, NPCI_RETRY_CAP, to_ist
 
 WEBHOOK_SECRET = "whsec_test_secret"
 EVENT_ID = "evt_live_001"
@@ -251,7 +251,128 @@ def test_spend_rows_age_out_of_the_rolling_window(client):
     assert budget.spent(RETRY_POOL) == 0
 
 
-def _boom(_events):
+def test_a_psp_vpa_is_tagged_and_excluded_from_bank_outage_correlation():
+    body = _payment_failed_body()
+    body["payload"]["payment"]["entity"]["vpa"] = "user@ybl"
+    # No bank/card issuer fields — the VPA is the only identity available.
+    event, provenance = webhook.failure_event_from_webhook("payment.failed", body)
+
+    assert event.issuer == f"{webhook.PSP_ISSUER_PREFIX}ybl"
+    assert "PSP" in provenance["issuer"]
+    assert "user@ybl" in provenance["issuer"]
+    assert "excluded from bank-outage correlation" in provenance["issuer"]
+
+
+def test_an_unambiguous_bank_vpa_maps_to_the_issuing_bank():
+    body = _payment_failed_body()
+    body["payload"]["payment"]["entity"]["vpa"] = "customer@okhdfcbank"
+    event, provenance = webhook.failure_event_from_webhook("payment.failed", body)
+
+    assert event.issuer == "HDFC"
+    assert "unambiguously" in provenance["issuer"]
+    assert "HDFC" in provenance["issuer"]
+    assert "customer@okhdfcbank" in provenance["issuer"]
+
+
+def test_a_missing_issuer_defaults_to_unknown_with_provenance():
+    body = _payment_failed_body()
+    entity = body["payload"]["payment"]["entity"]
+    entity.pop("vpa", None)
+    event, provenance = webhook.failure_event_from_webhook("payment.failed", body)
+
+    assert event.issuer == webhook.UNKNOWN_ISSUER
+    assert "excluded from bank-outage correlation" in provenance["issuer"]
+
+
+def test_an_ifsc_payload_resolves_to_the_right_bank():
+    body = _payment_failed_body()
+    entity = body["payload"]["payment"]["entity"]
+    entity.pop("vpa", None)
+    entity["ifsc"] = "SBIN0005943"
+    event, provenance = webhook.failure_event_from_webhook("payment.failed", body)
+
+    assert event.issuer == "SBIN"
+    assert "SBIN0005943" in provenance["issuer"]
+    assert "State Bank of India" in provenance["issuer"]
+    assert "ifsc-banknames.json" in provenance["issuer"]
+
+
+def test_an_unknown_bank_code_falls_back_rather_than_raising():
+    body = _payment_failed_body()
+    entity = body["payload"]["payment"]["entity"]
+    entity["vpa"] = "user@ybl"
+    entity["ifsc"] = "ZZZZ0000001"  # not in the vendored map
+    event, provenance = webhook.failure_event_from_webhook("payment.failed", body)
+
+    assert event.issuer == f"{webhook.PSP_ISSUER_PREFIX}ybl"
+    assert "unknown bank code 'ZZZZ'" in provenance["issuer"]
+    assert "falling through" in provenance["issuer"]
+    assert "PSP" in provenance["issuer"]
+
+
+def test_an_unknown_ifsc_with_no_vpa_becomes_unknown():
+    body = _payment_failed_body()
+    entity = body["payload"]["payment"]["entity"]
+    entity.pop("vpa", None)
+    entity["ifsc"] = "ZZZZ0000001"
+    event, provenance = webhook.failure_event_from_webhook("payment.failed", body)
+
+    assert event.issuer == webhook.UNKNOWN_ISSUER
+    assert "ZZZZ" in provenance["issuer"]
+
+
+def _technical_live_event(index: int, when: datetime) -> FailureEvent:
+    return FailureEvent(
+        event_id=f"buf_{index}",
+        payment_id=f"pay_buf_{index}",
+        subscription_id=MANDATE,
+        amount_paise=49_900,
+        method="upi_autopay",
+        issuer="HDFC",
+        error_code="BAD_REQUEST_ERROR",
+        error_source="issuer_bank",
+        error_step="payment_authorization",
+        error_reason="bank_technical_error",
+        occurred_at=when,
+        retries_used=0,
+        days_since_mandate_created=45,
+        day_of_month=to_ist(when).day,
+        issuer_recent_failure_rate=0.05,
+        amount_vs_customer_avg=1.0,
+        true_cause=None,
+    )
+
+
+def test_a_single_live_event_correlates_against_buffered_recent_events(client):
+    # Nine prior technical failures in the buffer + this webhook = denser than
+    # min_events. Without the buffer, diagnose_batch([event]) always returns {}.
+    now = datetime.now(timezone.utc)
+    buffer = webhook._recent_failures()
+    for index in range(9):
+        buffer.record(_technical_live_event(index, now))
+
+    stamp = int(now.timestamp())
+    body = _payment_failed_body()
+    body["created_at"] = stamp
+    entity = body["payload"]["payment"]["entity"]
+    entity.update(
+        {
+            "id": "pay_live_fleet",
+            "created_at": stamp,
+            "vpa": "customer@okhdfcbank",
+            "error_reason": "bank_technical_error",
+            "error_source": "issuer_bank",
+        }
+    )
+    response = _send(client, body, "evt_fleet")
+    assert response.json()["status"] == "processed"
+
+    latest = client.get("/live").json()[0]
+    assert latest["diagnosis"]["method"] == "fleet"
+    assert latest["diagnosis"]["cause"] == "ISSUER_DOWNTIME"
+
+
+def _boom(*_a, **_kw):
     raise RuntimeError("provider timeout")
 
 
@@ -371,9 +492,9 @@ def test_a_duplicate_event_id_is_processed_exactly_once(client, monkeypatch):
     calls = {"diagnose": 0}
     real = webhook.diagnose_batch
 
-    def counting(events):
+    def counting(events, **_kw):
         calls["diagnose"] += 1
-        return real(events)
+        return real(events, **_kw)
 
     monkeypatch.setattr(webhook, "diagnose_batch", counting)
 
