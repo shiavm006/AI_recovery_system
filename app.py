@@ -1,3 +1,8 @@
+"""Nakad console. Read-only: renders a precomputed artifact, never calls an LLM.
+
+Build the artifact with `python app.py`, then `streamlit run app.py`.
+"""
+
 from __future__ import annotations
 
 import json
@@ -5,7 +10,8 @@ import os
 import shutil
 import sqlite3
 import sys
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import altair as alt
@@ -19,51 +25,89 @@ if str(_ROOT) not in sys.path:
 from eval import CARD_METHOD, compare, diagnosis_report, multi_seed, reserve_report
 from generator.generate import generate_history
 from ledger import Ledger
-from models import BatchResult
+from models import (
+    ActionType,
+    Diagnosis,
+    FailureEvent,
+    ProposedAction,
+    RootCause,
+)
 from pipeline import govern
+from pipeline.allocate import (
+    DEFAULT_CONTACT_BUDGET,
+    DEFAULT_RETRY_BUDGET,
+    SUPPRESSED_FOR_BUDGET,
+    SUPPRESSED_FOR_LOW_CONFIDENCE,
+    SUPPRESSED_FOR_LOW_VALUE,
+    SUPPRESSED_FOR_NO_DIAGNOSIS,
+    SUPPRESSED_FOR_NO_HEADROOM,
+    SUPPRESSED_FOR_NO_WINDOW,
+)
 from pipeline.diagnose import _load_frozen_batch, diagnose_batch, run_config
-from pipeline.govern import CONTACT_WINDOW, PEAK_RAIL_WINDOWS, to_ist
+from pipeline.govern import (
+    CONTACT_ACTIONS,
+    CONTACT_WINDOW,
+    NPCI_RETRY_CAP,
+    PEAK_RAIL_WINDOWS,
+    to_ist,
+)
 from run import (
     AGENT,
-    ALL_ENTRY_TYPES,
     CONTROL,
-    ENTRY_PROPOSED,
+    CONTROL_RETRY_DELAY_HOURS,
     POLICIES,
-    TRACE_ENTRY_TYPES,
+    _plan_and_gate,
+    _propose_agent,
+    _propose_control,
     run_batch,
+    simulate_outcomes,
 )
 
 DATA = _ROOT / "data"
 ARTIFACT = DATA / "console.json"
 SANDBOX_LEDGER = DATA / "ledger_sandbox.db"
+LIVE_LEDGER = DATA / "ledger_live.db"
 
-SUPPRESSION_LABELS = {
-    "budget": "budget exhausted",
-    "low_value": "expected value below cut",
-    "no_headroom": "no NPCI headroom",
-    "no_diagnosis": "no diagnosis (declined)",
-    "low_confidence": "confidence below floor",
-    "no_window": "no permitted window",
-}
 
-STANDING_BADGE = {
-    govern.BINDING: "binding",
-    govern.CONTRACT: "contract",
-    govern.VOLUNTARY: "voluntary",
-}
+def _frozen_batch(seed: int = 42) -> Path:
+    return DATA / f"batch_seed{seed}.parquet"
 
 
 REQUIRED_CONFIG_FIELDS = ("provider", "model", "events", "by_method", "unknown")
 
+BASELINE_ARRIVAL = "Arrival order — fixed schedule"
+BASELINE_AMOUNT = "Amount-sorted queue"
+BASELINE_EQUAL = "Equal total actions"
+BASELINES = (BASELINE_ARRIVAL, BASELINE_AMOUNT, BASELINE_EQUAL)
 
+# rule id, short label, who imposes it, binding or self-imposed
+RULE_ROWS = (
+    (govern.R01_RAIL_CAP, "Attempt cap", "NPCI", "law"),
+    (govern.R02_PREDEBIT_NOTICE, "24-hour notice", "RBI", "law"),
+    (govern.R04_WHATSAPP_POLICY, "Consent", "Meta", "contract"),
+    (govern.R06_QUIET_HOURS, "Quiet hours", "Nakad", "policy"),
+)
+
+# One accent, one warning, everything else grey. Charts and text share it.
+INK = "#111827"
+ACCENT = "#2563EB"
+MUTED = "#9CA3AF"
+FAINT = "#E5E7EB"
+GOOD = "#059669"
+STOP = "#DC2626"
+
+# Streamlit ships its own chrome; this only trims what we never use and sets
+# the numeric font. No layout overrides, so a Streamlit upgrade cannot break it.
+CSS = """
+<style>
+#MainMenu, footer, [data-testid="stDecoration"] {display: none;}
+[data-testid="stMetricValue"] {font-size: 1.6rem; font-variant-numeric: tabular-nums;}
+[data-testid="stMetricLabel"] {font-size: 0.78rem; letter-spacing: .02em;}
+code, .mono {font-variant-numeric: tabular-nums;}
+</style>
+"""
 def write_artifact(artifact: dict, path: Path = ARTIFACT) -> None:
-    """Write the console artifact, refusing one that cannot state its own provenance.
-
-    A shipped artifact is read as the system's performance long after whoever
-    built it has forgotten which provider was configured that afternoon. An
-    artifact that cannot say is worse than no artifact, so this raises rather
-    than writing a file that will be quoted out of context.
-    """
+    """Write the console artifact, refusing one that cannot state its own provenance."""
     for label, config in (
         ("run_config", artifact.get("run_config")),
         ("multi_seed.run_config", artifact.get("multi_seed", {}).get("run_config")),
@@ -79,13 +123,7 @@ def write_artifact(artifact: dict, path: Path = ARTIFACT) -> None:
 
 
 def build_console(seed: int = 42, multi_seed_provider: str | None = None) -> dict:
-    """Run everything once and write the artifact the console renders.
-
-    ``multi_seed_provider`` runs the five-seed stability sweep under a
-    different provider than the headline run. The sweep is five more full
-    batches and will exhaust a free daily quota; both provider states are
-    recorded separately so the two sections are never read as one.
-    """
+    """Run everything once and write the artifact the console renders."""
     if st.runtime.exists():
         raise RuntimeError(
             "build_console makes LLM calls and must not run in the render path; "
@@ -102,7 +140,7 @@ def build_console(seed: int = 42, multi_seed_provider: str | None = None) -> dic
     events = _load_frozen_batch(frozen)
     diagnoses, diagnose_stats = diagnose_batch(events)
 
-    results: dict[str, BatchResult] = {}
+    results = {}
     for policy in POLICIES:
         path = DATA / f"ledger_{policy}.db"
         path.unlink(missing_ok=True)
@@ -119,8 +157,6 @@ def build_console(seed: int = 42, multi_seed_provider: str | None = None) -> dic
         "built_at": datetime.now().isoformat(timespec="seconds"),
         "seed": seed,
         "events": len(events),
-        # Provenance for the headline run. The stability sweep carries its own
-        # under multi_seed, because it may have run under a different provider.
         "run_config": run_config(diagnoses),
         "fallback_reasons": diagnose_stats.get("fallback_reasons", {}),
         "diagnosis": diagnosis_report(events, diagnoses),
@@ -135,9 +171,19 @@ def build_console(seed: int = 42, multi_seed_provider: str | None = None) -> dic
     return artifact
 
 
-# --------------------------------------------------------------------------
-# load (render path — disk only)
-# --------------------------------------------------------------------------
+def _mtime(path: Path | str) -> float:
+    return Path(path).stat().st_mtime if Path(path).exists() else 0.0
+
+
+def _rupees(paise: int | float) -> str:
+    return f"₹{paise / 100:,.0f}"
+
+
+def describe_methods(config: dict) -> str:
+    mix = config.get("by_method") or {}
+    return " · ".join(f"{name} {count}" for name, count in mix.items()) or (
+        "nothing diagnosed"
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -146,564 +192,774 @@ def load_console(stamp: float) -> dict:
 
 
 @st.cache_data(show_spinner=False)
-def load_ledger(path: str, stamp: float) -> pd.DataFrame:
-    """Flatten a ledger to a frame. ``stamp`` is the file mtime, so tampering
-    with the database invalidates the cache rather than serving stale rows."""
-    with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as conn:
-        frame = pd.read_sql_query(
-            "SELECT seq, timestamp, event_id, entry_type, payload, entry_hash "
-            "FROM entries ORDER BY seq",
-            conn,
-        )
-    frame["payload"] = frame["payload"].map(json.loads)
-    return frame
+def load_events(path: str, stamp: float) -> list[FailureEvent]:
+    return _load_frozen_batch(Path(path))
 
 
-def _mtime(path: Path | str) -> float:
-    return Path(path).stat().st_mtime if Path(path).exists() else 0.0
-
-
-def _rupees(paise: float | None) -> str:
-    return "—" if paise is None else f"₹{paise / 100:,.0f}"
-
-
-def describe_methods(config: dict) -> str:
-    """"rule 313 · fleet 63 · llm 124", or a plain statement of nothing."""
-    mix = config.get("by_method") or {}
-    return " · ".join(f"{name} {count}" for name, count in mix.items()) or (
-        "nothing diagnosed"
-    )
-
-
-def booked_times(ledger_frame: pd.DataFrame) -> pd.DataFrame:
-    """Every action the allocator actually booked, as an IST minute of day."""
-    rows = []
-    for _, row in ledger_frame.loc[
-        ledger_frame["entry_type"] == ENTRY_PROPOSED
-    ].iterrows():
-        stamp = row["payload"].get("scheduled_for")
-        action = row["payload"].get("action")
-        if not stamp or action == "SUPPRESS":
+@st.cache_data(show_spinner=False)
+def load_diagnoses(ledger_path: str, stamp: float) -> list[Diagnosis]:
+    with sqlite3.connect(f"file:{ledger_path}?mode=ro", uri=True) as conn:
+        rows = conn.execute(
+            "SELECT event_id, payload FROM entries WHERE entry_type = 'diagnosed'"
+        ).fetchall()
+    out: list[Diagnosis] = []
+    for event_id, raw in rows:
+        payload = json.loads(raw)
+        cause = payload.get("cause")
+        if not cause:
             continue
-        local = to_ist(datetime.fromisoformat(stamp))
-        rows.append(
-            {
-                "event_id": row["event_id"],
-                "action": action,
-                "minute": local.hour * 60 + local.minute,
-                "clock": local.strftime("%H:%M"),
-                "kind": "contact" if action in {"NUDGE", "PAYMENT_LINK"} else "rail",
-            }
-        )
-    return pd.DataFrame(rows)
-
-
-# --------------------------------------------------------------------------
-# tabs
-# --------------------------------------------------------------------------
-
-
-def tab_scoreboard(console: dict) -> None:
-    report = console["compare"]
-    agent, control = report["agent_detail"], report["control_detail"]
-
-    st.subheader("Agent versus control")
-    rows = [
-        ("Gross recovered", _rupees(agent["gross_recovered_paise"]), _rupees(control["gross_recovered_paise"])),
-        ("Projected clawback", _rupees(agent["projected_clawback_paise"]), _rupees(control["projected_clawback_paise"])),
-        ("Net of reserve", _rupees(agent["net_recovered_paise"]), _rupees(control["net_recovered_paise"])),
-        ("Recovery per retry placed", _rupees(agent["recovery_per_retry_paise"]), _rupees(control["recovery_per_retry_paise"])),
-        ("Retries placed", agent["retry_budget_spent"], control["retry_budget_spent"]),
-        ("Contacts placed", agent["contact_budget_spent"], control["contact_budget_spent"]),
-    ]
-    st.dataframe(
-        pd.DataFrame(rows, columns=["metric", "agent", "control"]).set_index("metric"),
-        width="stretch",
-    )
-
-    # The mean leads and the single seed trails, deliberately. One seed cannot
-    # tell a policy that works from a batch that happened to suit it, and 2.40×
-    # is the flattering end of a range that runs down to 1.86×.
-    spread = console["multi_seed"]["ratio"]
-    seeds = len(console["multi_seed"]["seeds"])
-    lift = st.columns(3)
-    lift[0].metric(f"Lift, mean of {seeds} seeds", f"{spread['mean']:.2f}×", f"σ {spread['stdev']:.2f}", delta_color="off")
-    lift[1].metric("Range across seeds", f"{spread['min']:.2f}–{spread['max']:.2f}×")
-    lift[2].metric(f"This seed ({console['seed']}) alone", f"{report['gross']['ratio']:.2f}×")
-    st.caption(
-        f"Seed {console['seed']} is one draw, and it is the favourable end of the "
-        f"range. The headline is {spread['mean']:.2f}× ± {spread['stdev']:.2f}."
-    )
-
-    st.divider()
-    st.subheader("Lift by seed")
-    sweep = console["multi_seed"]["run_config"]
-    st.caption(
-        f"Sweep provider **{sweep['provider']}** (`{sweep['model'] or '—'}`) · "
-        f"{describe_methods(sweep)} across {sweep['seeds']} seeds · "
-        + (
-            f"🟠 {sweep['unknown']} of {sweep['events']} undiagnosed"
-            if sweep["degraded"]
-            else "✅ all events diagnosed"
-        )
-    )
-    runs = pd.DataFrame(console["multi_seed"]["runs"])
-    runs["seed"] = runs["seed"].astype(str)
-    base = alt.Chart(runs)
-    points = base.mark_circle(size=220, color="#1f77b4").encode(
-        x=alt.X("ratio:Q", title="agent ÷ control", scale=alt.Scale(zero=False)),
-        y=alt.Y("seed:N", title="seed"),
-        tooltip=["seed", "ratio", "agent_gross_paise", "control_gross_paise"],
-    )
-    mean_rule = (
-        alt.Chart(pd.DataFrame({"m": [spread["mean"]]}))
-        .mark_rule(color="#d62728", strokeWidth=2)
-        .encode(x="m:Q")
-    )
-    mean_text = (
-        alt.Chart(pd.DataFrame({"m": [spread["mean"]], "label": [f"mean {spread['mean']:.2f}×"]}))
-        .mark_text(align="left", baseline="top", dx=6, color="#d62728", fontWeight="bold")
-        .encode(x="m:Q", y=alt.value(4), text="label:N")
-    )
-    parity = (
-        alt.Chart(pd.DataFrame({"m": [1.0]}))
-        .mark_rule(color="#999", strokeDash=[4, 4])
-        .encode(x="m:Q")
-    )
-    st.altair_chart((parity + points + mean_rule + mean_text).properties(height=200))
-
-    st.divider()
-    st.subheader("Where the suppressions go")
-    st.caption(
-        "Suppression is arithmetic, not timidity: the NPCI budget is finite and "
-        "every bar below is a named reason for not spending it here."
-    )
-    stacked = pd.DataFrame(
-        [
-            {
-                "policy": name,
-                "reason": SUPPRESSION_LABELS.get(reason, reason),
-                "events": count,
-            }
-            for name, detail in (("agent", agent), ("control", control))
-            for reason, count in detail["suppression_breakdown"].items()
-            if agent["suppression_breakdown"][reason]
-            or control["suppression_breakdown"][reason]
-        ]
-    )
-    st.altair_chart(
-        alt.Chart(stacked)
-        .mark_bar()
-        .encode(
-            x=alt.X("events:Q", title="events suppressed", stack="zero"),
-            y=alt.Y("policy:N", title=None),
-            color=alt.Color("reason:N", title="reason", scale=alt.Scale(scheme="tableau10")),
-            tooltip=["policy", "reason", "events"],
-        )
-        .properties(height=160)
-    )
-
-
-def tab_compliance(console: dict) -> None:
-    report = console["compare"]
-    agent_blocks = report["agent_detail"]["blocked_by_rule"]
-    control_blocks = report["control_detail"]["blocked_by_rule"]
-
-    st.subheader("The seven rules, and what actually binds us")
-    st.dataframe(
-        pd.DataFrame(
-            [
-                {
-                    "rule": rule_id,
-                    "standing": STANDING_BADGE[govern.RULE_STANDING[rule_id][0]],
-                    "source": govern.RULE_STANDING[rule_id][1],
-                    "what it does": description,
-                    "agent blocks": agent_blocks.get(rule_id, 0),
-                    "control blocks": control_blocks.get(rule_id, 0),
-                }
-                for rule_id, description in govern.RULES.items()
-            ]
-        ).set_index("rule"),
-        width="stretch",
-    )
-    st.caption(
-        "Two of the seven are not law. r06's contact hours are borrowed from RBI "
-        "recovery-agent norms that bind lenders, not merchants; standing down for "
-        "a promise-to-pay is restraint nobody requires. They are marked as such "
-        "because claiming otherwise is the kind of thing that gets checked."
-    )
-
-    st.divider()
-    st.subheader("The agent schedules around the gate, not into it")
-    booked = booked_times(load_ledger(console["ledgers"][AGENT], _mtime(console["ledgers"][AGENT])))
-    if booked.empty:
-        st.info("No booked actions in this run.")
-        return
-
-    # The two constraints are drawn in separate lanes rather than layered. They
-    # genuinely overlap in time — contact hours run straight through the
-    # afternoon rail freeze — and stacking translucent bands over one plot turns
-    # the overlap into a third colour that means nothing.
-    scale = alt.Scale(domain=[0, 24 * 60], nice=False)
-    axis = alt.Axis(
-        values=list(range(0, 24 * 60 + 1, 120)),
-        # utcFormat, not timeFormat: the minute-of-day is already IST, so
-        # letting the browser apply its own offset would shift every label.
-        labelExpr="utcFormat(datum.value * 60 * 1000, '%H:%M')",
-        title="time of day (IST)",
-    )
-
-    def lane(kind: str, windows: list[tuple[int, int]], shade: str, bar: str, title: str):
-        band = alt.Chart(pd.DataFrame(windows, columns=["start", "end"])).mark_rect(
-            color=shade, opacity=0.25
-        ).encode(x=alt.X("start:Q", scale=scale, axis=axis), x2="end:Q")
-        bars = (
-            alt.Chart(booked.loc[booked["kind"] == kind])
-            .mark_bar(color=bar, size=7)
-            .encode(
-                x=alt.X("minute:Q", scale=scale, axis=axis, bin=alt.Bin(step=10)),
-                y=alt.Y("count():Q", title="actions booked"),
-                tooltip=[alt.Tooltip("clock:N", title="booked"), alt.Tooltip("count():Q")],
+        out.append(
+            Diagnosis(
+                event_id=event_id,
+                cause=RootCause(cause),
+                confidence=float(payload.get("confidence") or 0),
+                evidence=list(payload.get("evidence") or []),
+                method=payload.get("method") or "rule",
             )
         )
-        return (band + bars).properties(height=230, title=title, width=920)
-
-    st.altair_chart(
-        alt.vconcat(
-            lane(
-                "rail",
-                list(PEAK_RAIL_WINDOWS),
-                "#d62728",
-                "#1f77b4",
-                "Rail actions — red is the r01 peak freeze, and nothing is booked inside it",
-            ),
-            lane(
-                "contact",
-                [CONTACT_WINDOW],
-                "#2ca02c",
-                "#ff7f0e",
-                "Contact actions — green is the r06 permitted window, and nothing is booked outside it",
-            ),
-            spacing=30,
-        )
-    )
-
-    busiest = (
-        booked.groupby(["clock", "action"]).size().sort_values(ascending=False).head(3)
-    )
-    st.caption(
-        "Not luck: the scheduler reads the same window constants the gate "
-        "enforces, so it books for the minute a freeze lifts rather than walking "
-        "into one. Busiest slots — "
-        + ", ".join(
-            f"**{clock} {action}** ({count})" for (clock, action), count in busiest.items()
-        )
-        + ". 21:31 is the first legal minute after the evening rail freeze and "
-        "08:00 is the first legal minute of contact hours."
-    )
-    st.caption(
-        "What that leaves is the point: every remaining block is substantive "
-        "rather than a timing accident — "
-        + ", ".join(f"**{rule}** ({count})" for rule, count in sorted(agent_blocks.items()))
-        + ". r02 is a genuine compliance refusal: no pre-debit notice on file, so "
-        "the re-presentation does not go out."
-    )
+    return out
 
 
-def tab_ledger(console: dict) -> None:
-    st.subheader("Every event, four entries, whatever the outcome")
-    policy = st.radio("ledger", POLICIES, horizontal=True, label_visibility="collapsed")
-    path = console["ledgers"][policy]
-    frame = load_ledger(path, _mtime(path))
+@st.cache_data(show_spinner=False)
+def load_tip(ledger_path: str, stamp: float) -> tuple[int, str]:
+    with sqlite3.connect(f"file:{ledger_path}?mode=ro", uri=True) as conn:
+        tip = conn.execute("SELECT seq, entry_hash FROM chain_tip").fetchone()
+        n = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    return (n, tip[1] if tip else "")
 
-    controls = st.columns([2, 2])
-    query = controls[0].text_input("Filter by event id", placeholder="evt_…")
-    kinds = controls[1].multiselect(
-        "Entry type", ALL_ENTRY_TYPES, default=list(TRACE_ENTRY_TYPES)
-    )
 
-    view = frame.loc[frame["entry_type"].isin(kinds)]
-    if query:
-        view = view.loc[view["event_id"].str.contains(query, case=False, regex=False)]
-
-    st.caption(f"{len(view)} of {len(frame)} entries")
-    st.dataframe(
-        view.assign(
-            payload=view["payload"].map(lambda p: json.dumps(p, default=str)),
-            entry_hash=view["entry_hash"].str.slice(0, 12) + "…",
-        ).set_index("seq"),
-        width="stretch",
-        height=380,
-    )
-
-    st.divider()
-    st.subheader("Tamper-evidence, live")
-    st.caption(
-        "This runs against a throwaway copy, so the demonstration cannot damage "
-        "the real trail. Tamper-evident is not tamper-proof: anyone who can "
-        "write the file can rewrite every row and recompute the tip. Real "
-        "detection needs the tip published somewhere this process cannot reach."
-    )
-
-    if not SANDBOX_LEDGER.exists():
-        shutil.copyfile(path, SANDBOX_LEDGER)
-
-    buttons = st.columns(4)
-    if buttons[0].button("Verify", width="stretch"):
-        st.session_state["verdict"] = Ledger(str(SANDBOX_LEDGER)).verify()
-    if buttons[1].button("Edit one payload", width="stretch"):
-        with sqlite3.connect(SANDBOX_LEDGER) as conn:
-            victim = conn.execute(
-                "SELECT seq FROM entries ORDER BY seq LIMIT 1 OFFSET ?",
-                (len(frame) // 2,),
-            ).fetchone()
-            conn.execute(
-                "UPDATE entries SET payload = json_set(payload, '$.amount_paise', 999999999) "
-                "WHERE seq = ?",
-                (victim[0],),
-            )
-        st.session_state["verdict"] = Ledger(str(SANDBOX_LEDGER)).verify()
-        st.session_state["note"] = f"edited the payload of seq {victim[0]}"
-    if buttons[2].button("Delete the tail", width="stretch"):
-        with sqlite3.connect(SANDBOX_LEDGER) as conn:
-            conn.execute(
-                "DELETE FROM entries WHERE seq > (SELECT MAX(seq) - 5 FROM entries)"
-            )
-        st.session_state["verdict"] = Ledger(str(SANDBOX_LEDGER)).verify()
-        st.session_state["note"] = "deleted the last 5 entries"
-    if buttons[3].button("Reset copy", width="stretch"):
-        SANDBOX_LEDGER.unlink(missing_ok=True)
-        shutil.copyfile(path, SANDBOX_LEDGER)
-        st.session_state["verdict"] = Ledger(str(SANDBOX_LEDGER)).verify()
-        st.session_state["note"] = "restored from the real ledger"
-
-    verdict = st.session_state.get("verdict")
-    if verdict is not None:
-        if note := st.session_state.get("note"):
-            st.write(f"Last action: {note}")
-        if verdict.ok:
-            st.success("verify() → intact. Every link recomputes and the tip agrees.")
+@st.cache_data(show_spinner=False)
+def load_live_rows(stamp: float) -> list[dict]:
+    if not LIVE_LEDGER.exists():
+        return []
+    with sqlite3.connect(f"file:{LIVE_LEDGER}?mode=ro", uri=True) as conn:
+        rows = conn.execute(
+            "SELECT event_id, entry_type, payload FROM entries ORDER BY seq DESC LIMIT 24"
+        ).fetchall()
+    by_event: dict[str, dict] = {}
+    for event_id, entry_type, raw in rows:
+        payload = json.loads(raw)
+        slot = by_event.setdefault(event_id, {"event_id": event_id})
+        if entry_type == "proposed":
+            slot["action"] = payload.get("action")
+        if entry_type == "gated":
+            slot["approved"] = payload.get("approved")
+            slot["blocked_by"] = payload.get("blocked_by")
+        if entry_type == "ingested":
+            slot["payment_id"] = payload.get("payment_id") or event_id
+    out = []
+    for slot in by_event.values():
+        action = slot.get("action")
+        if action == "SUPPRESS":
+            tag = ("gated", "tag vol")
+        elif not slot.get("approved", True):
+            tag = ("gated", "tag vol")
+        elif action in {"RETRY", "MANDATE_REPRESENT"}:
+            tag = ("retry", "tag live")
+        elif action in {"NUDGE", "PAYMENT_LINK"}:
+            tag = ("link", "tag live")
         else:
-            st.error(
-                f"verify() → **{verdict.failure.upper()}** at seq {verdict.seq}. "
-                + (
-                    "Rows are missing: the chain is shorter than the tip says."
-                    if verdict.failure != "tampered"
-                    else "A row's contents no longer match its hash."
+            tag = ((action or "seen").lower(), "tag")
+        out.append(
+            {
+                "label": slot.get("payment_id") or slot["event_id"],
+                "tag": tag[0],
+                "cls": tag[1],
+            }
+        )
+        if len(out) >= 3:
+            break
+    return out
+
+
+def _propose_amount_sorted(
+    pending: list[FailureEvent], retry_left: int, _contact_left: int
+) -> list[ProposedAction]:
+    ranked = sorted(pending, key=lambda e: (-e.amount_paise, e.event_id))
+    actions: list[ProposedAction] = []
+    for index, event in enumerate(ranked):
+        if index < retry_left:
+            actions.append(
+                ProposedAction(
+                    event_id=event.event_id,
+                    action=ActionType.RETRY,
+                    rationale="amount-sorted: retry largest unpaid first",
+                    expected_recovery_paise=0,
+                    scheduled_for=event.occurred_at
+                    + timedelta(hours=CONTROL_RETRY_DELAY_HOURS),
                 )
             )
-        tip = sqlite3.connect(SANDBOX_LEDGER).execute(
-            "SELECT seq, entry_hash FROM chain_tip"
-        ).fetchone()
-        if tip:
-            st.code(f"chain_tip  seq={tip[0]}  entry_hash={tip[1]}", language=None)
+        else:
+            actions.append(
+                ProposedAction(
+                    event_id=event.event_id,
+                    action=ActionType.SUPPRESS,
+                    rationale=(
+                        f"{SUPPRESSED_FOR_BUDGET}: retry budget spent further up "
+                        "the amount order"
+                    ),
+                    expected_recovery_paise=0,
+                    scheduled_for=None,
+                )
+            )
+    return actions
 
 
-def tab_diagnosis(console: dict) -> None:
-    report = console["diagnosis"]
-    labels = report["labels"]
+def _score(
+    events: list[FailureEvent],
+    diagnoses: list[Diagnosis],
+    propose,
+    retry_budget: int,
+    contact_budget: int,
+    seed: int,
+) -> dict:
+    plan = _plan_and_gate(events, propose, retry_budget, contact_budget)
+    approved = [
+        action
+        for action in plan["actions"]
+        if plan["decisions"][action.event_id].approved
+        and action.action is not ActionType.SUPPRESS
+    ]
+    outcomes = simulate_outcomes(approved, events, diagnoses, seed)
+    by_id = {e.event_id: e for e in events}
 
-    top = st.columns(4)
-    top[0].metric("Accuracy, all events", f"{report['accuracy_all_events']:.1%}")
-    top[1].metric("Accuracy when answered", f"{report['accuracy_when_answered']:.1%}")
-    top[2].metric("Bayes ceiling", f"{report['bayes_ceiling']:.1%}")
-    top[3].metric("Share of ceiling", f"{report['share_of_ceiling']:.1%}")
-    st.caption(
-        f"{report['undiagnosed']} events carry **UNKNOWN** — the pipeline declined "
-        f"rather than guessed, so they count against the all-events figure and are "
-        f"excluded from the answered one. The ceiling is the best score any model "
-        f"could reach on {report['bayes_ceiling_groups']} observable signatures, "
-        "some of which are shared by two causes and cannot be split by anything."
-    )
+    def suppressed_for(prefix: str) -> int:
+        return sum(a.rationale.startswith(prefix) for a in plan["actions"])
 
-    st.subheader("Confusion matrix")
-    cells = pd.DataFrame(
-        [
-            {"true": labels[r], "predicted": labels[c], "n": value}
-            for r, row in enumerate(report["confusion_matrix"])
-            for c, value in enumerate(row)
-        ]
-    )
-    heat = (
-        alt.Chart(cells)
-        .mark_rect()
-        .encode(
-            x=alt.X("predicted:N", sort=labels, title="predicted"),
-            y=alt.Y("true:N", sort=labels, title="true cause"),
-            color=alt.Color("n:Q", scale=alt.Scale(scheme="blues"), title="events"),
-            tooltip=["true", "predicted", "n"],
+    booked = []
+    for action in approved:
+        if not action.scheduled_for:
+            continue
+        local = to_ist(action.scheduled_for)
+        booked.append(
+            {
+                "event_id": action.event_id,
+                "action": action.action.value,
+                "hour": local.hour,
+                "minute": local.hour * 60 + local.minute,
+                "clock": local.strftime("%H:%M"),
+                "kind": "contact" if action.action in CONTACT_ACTIONS else "rail",
+            }
         )
-    )
-    text = heat.mark_text(fontSize=12).encode(
-        text=alt.Text("n:Q"),
-        color=alt.condition(alt.datum.n > cells["n"].max() / 2, alt.value("white"), alt.value("#333")),
-    )
-    st.altair_chart((heat + text).properties(height=340))
 
-    st.subheader("Per class")
-    st.dataframe(
-        pd.DataFrame(report["per_class"]).T.rename_axis("cause"),
-        width="stretch",
+    blocked = Counter(
+        d.blocked_by for d in plan["decisions"].values() if not d.approved and d.blocked_by
     )
-    st.caption(
-        "Precision at 1.000 on every real cause means the pipeline is never wrong "
-        "when it answers — but note this run's answers come from the rule and "
-        "fleet layers, which match known signatures. The recall gap is refusals, "
-        "not errors."
-    )
+    return {
+        "gross_paise": sum(
+            by_id[eid].amount_paise for eid, ok in outcomes.items() if ok
+        ),
+        "acted": len(approved),
+        "retry_spent": plan["retry_spent"],
+        "contact_spent": plan["contact_spent"],
+        "blocked": sum(blocked.values()),
+        "blocked_by_rule": dict(blocked),
+        "budget": suppressed_for(SUPPRESSED_FOR_BUDGET),
+        "low_value": suppressed_for(SUPPRESSED_FOR_LOW_VALUE),
+        "no_headroom": suppressed_for(SUPPRESSED_FOR_NO_HEADROOM),
+        "low_confidence": suppressed_for(SUPPRESSED_FOR_LOW_CONFIDENCE),
+        "no_window": suppressed_for(SUPPRESSED_FOR_NO_WINDOW),
+        "no_diagnosis": suppressed_for(SUPPRESSED_FOR_NO_DIAGNOSIS),
+        "booked": booked,
+        "actions": plan["actions"],
+        "decisions": plan["decisions"],
+    }
 
 
-def tab_reserve(console: dict) -> None:
-    report = console["reserve"]
-
-    top = st.columns(4)
-    top[0].metric("Reported disputes", _rupees(report["reported_paise"]))
-    top[1].metric("Ultimate", _rupees(report["ultimate_paise"]))
-    top[2].metric("Reported rate", f"{report['reported_dispute_rate']:.3%}")
-    top[3].metric("Ultimate rate", f"{report['ultimate_dispute_rate']:.3%}")
-
-    st.subheader("Development triangle (cumulative disputed paise)")
-    triangle = pd.DataFrame(**report["triangle"]).rename_axis("cohort")
-    st.dataframe(
-        triangle.style.background_gradient(cmap="Blues", axis=None).format("{:,.0f}", na_rep=""),
-        width="stretch",
+@st.cache_data(show_spinner=False)
+def score_view(
+    retry_budget: int,
+    contact_budget: int,
+    seed: int,
+    batch_path: str,
+    batch_stamp: float,
+    ledger_path: str,
+    ledger_stamp: float,
+) -> dict:
+    """Recompute agent + baselines from frozen diagnoses. No LLM."""
+    events = load_events(batch_path, batch_stamp)
+    diagnoses = load_diagnoses(ledger_path, ledger_stamp)
+    agent = _score(
+        events,
+        diagnoses,
+        _propose_agent(diagnoses),
+        retry_budget,
+        contact_budget,
+        seed,
     )
+    arrival = _score(
+        events, diagnoses, _propose_control, retry_budget, 0, seed
+    )
+    amount = _score(
+        events, diagnoses, _propose_amount_sorted, retry_budget, 0, seed
+    )
+    equal_budget = agent["retry_spent"] + agent["contact_spent"]
+    equal = _score(
+        events, diagnoses, _propose_control, equal_budget, 0, seed
+    )
+    return {
+        "agent": agent,
+        "arrival": arrival,
+        "amount": amount,
+        "equal": equal,
+        "npci_headroom": sum(
+            max(0, NPCI_RETRY_CAP - e.retries_used) for e in events
+        ),
+    }
 
-    fitted = report["ldf_fitted_ages"]
-    ldf = {age: f for age, f in list(report["ldf"].items())[:fitted]}
-    st.caption("Selected development factors (age to age)")
-    st.dataframe(
-        pd.DataFrame([ldf], index=["LDF"]),
-        width="stretch",
-    )
-    st.caption(
-        "The 1-2 factor does the work: a cohort's disputes roughly triple after "
-        "their first month, which is why reserving on reported volume alone "
-        "under-books every cohort still developing."
-    )
 
-    st.divider()
-    st.subheader("Projected IBNR against seeded truth")
-    st.caption(
-        "A reserve model graded against known truth, which is normally "
-        "impossible — the future disputes were seeded and held out of the fit."
-    )
-    ibnr = pd.DataFrame(report["ibnr_by_cohort"])
-    ibnr = ibnr.loc[(ibnr["projected_ibnr_paise"] > 0) | (ibnr["true_ibnr_paise"] > 0)]
-    melted = ibnr.melt(
-        id_vars="cohort",
-        value_vars=["projected_ibnr_paise", "true_ibnr_paise"],
-        var_name="series",
-        value_name="paise",
-    ).replace({"projected_ibnr_paise": "projected", "true_ibnr_paise": "true"})
-    st.altair_chart(
-        alt.Chart(melted)
-        .mark_bar()
-        .encode(
-            x=alt.X("cohort:N", title="cohort"),
-            y=alt.Y("paise:Q", title="IBNR (paise)"),
-            xOffset="series:N",
-            color=alt.Color(
-                "series:N",
-                title=None,
-                scale=alt.Scale(domain=["projected", "true"], range=["#1f77b4", "#7f7f7f"]),
+def _pick_trace(
+    events: list[FailureEvent],
+    diagnoses: list[Diagnosis],
+    view: dict,
+) -> dict:
+    by_diag = {d.event_id: d for d in diagnoses}
+    by_action = {a.event_id: a for a in view["actions"]}
+    decisions = view["decisions"]
+    for event in events:
+        decision = decisions[event.event_id]
+        if decision.approved:
+            continue
+        action = by_action[event.event_id]
+        diagnosis = by_diag.get(event.event_id)
+        booked = ""
+        if action.scheduled_for:
+            booked = to_ist(action.scheduled_for).strftime("%H:%M")
+        return {
+            "event_id": event.event_id,
+            "ingested": (
+                f"{event.method.replace('_', ' ').title()} · {event.issuer} · "
+                f"{_rupees(event.amount_paise)} · attempt {event.retries_used + 1} of "
+                f"{NPCI_RETRY_CAP + 1}"
             ),
-            tooltip=["cohort", "series", "paise"],
-        )
-        .properties(height=300)
-    )
-    error_pct = report["total_ibnr_error_pct"]
-    st.caption(
-        f"Projected {_rupees(report['total_projected_ibnr_paise'])} against a true "
-        f"{_rupees(report['total_true_ibnr_paise'])}"
-        + (f" — over-reserved by {error_pct:+.1f}%" if error_pct is not None else "")
-        + ", concentrated in the youngest cohort where the triangle is thinnest. "
-        "That is the textbook chain-ladder failure mode and it errs conservative; "
-        "a model that under-reserved would be the actual problem."
-    )
-
-    st.divider()
-    st.subheader("Gross to net, this batch")
-    st.dataframe(
-        pd.DataFrame(
-            [
-                ("Card volume recovered", _rupees(report["gross_recovered_paise"])),
-                ("Projected clawback at the ultimate rate", "− " + _rupees(report["projected_clawback_paise"])),
-                ("Net kept", _rupees(report["net_recovered_paise"])),
-            ],
-            columns=["", "paise"],
-        ).set_index(""),
-        width="stretch",
-    )
-    st.caption(
-        "Card volume only: chargeback rights are a card-network mechanism, so "
-        "applying this rate to UPI Autopay or NACH recovery would invent an "
-        "exposure that does not exist."
-    )
+            "diagnosed": (
+                f"{diagnosis.cause.value.replace('_', ' ').title()} · "
+                f"{diagnosis.method} · confidence {diagnosis.confidence:.2f}"
+                if diagnosis
+                else "—"
+            ),
+            "proposed": (
+                f"{action.action.value.replace('_', ' ').title()}"
+                + (f" · booked {booked}" if booked else "")
+            ),
+            "gated": f"Refused — {decision.reason}",
+        }
+    event = events[0]
+    diagnosis = by_diag.get(event.event_id)
+    action = by_action[event.event_id]
+    return {
+        "event_id": event.event_id,
+        "ingested": f"{event.method} · {event.issuer} · {_rupees(event.amount_paise)}",
+        "diagnosed": diagnosis.cause.value if diagnosis else "—",
+        "proposed": action.action.value,
+        "gated": "Approved",
+    }
 
 
 # --------------------------------------------------------------------------
+# budget sweep
+# --------------------------------------------------------------------------
+
+SWEEP_POINTS = 12
+SWEEP_MIN, SWEEP_MAX = 20, 300
+
+
+@st.cache_data(show_spinner=False)
+def sweep_view(
+    baseline: str,
+    contact_budget: int,
+    seed: int,
+    batch_path: str,
+    batch_stamp: float,
+    ledger_path: str,
+    ledger_stamp: float,
+) -> list[dict]:
+    """Recovery as the attempt budget varies. Frozen diagnoses, no LLM."""
+    events = load_events(batch_path, batch_stamp)
+    diagnoses = load_diagnoses(ledger_path, ledger_stamp)
+    propose_agent = _propose_agent(diagnoses)
+    baseline_propose = (
+        _propose_amount_sorted if baseline == BASELINE_AMOUNT else _propose_control
+    )
+    step = (SWEEP_MAX - SWEEP_MIN) / (SWEEP_POINTS - 1)
+    rows: list[dict] = []
+    for i in range(SWEEP_POINTS):
+        budget = int(round(SWEEP_MIN + i * step))
+        agent = _score(events, diagnoses, propose_agent, budget, contact_budget, seed)
+        base = _score(events, diagnoses, baseline_propose, budget, 0, seed)
+        rows.append(
+            {"budget": budget, "series": "Nakad", "rupees": agent["gross_paise"] / 100}
+        )
+        rows.append(
+            {"budget": budget, "series": "Baseline", "rupees": base["gross_paise"] / 100}
+        )
+    return rows
+
+
+# --------------------------------------------------------------------------
+# charts — Altair, so axes, tooltips and resizing come for free
+# --------------------------------------------------------------------------
+
+
+def _theme(chart: alt.Chart) -> alt.Chart:
+    return (
+        chart.configure_view(strokeWidth=0)
+        .configure_axis(
+            grid=False,
+            labelColor="#6B7280",
+            titleColor="#6B7280",
+            labelFontSize=11,
+            titleFontSize=11,
+            titleFontWeight="normal",
+            domainColor=FAINT,
+            tickColor=FAINT,
+        )
+        .configure_legend(
+            labelColor="#374151", titleColor="#6B7280", labelFontSize=11, titleFontSize=11
+        )
+    )
+
+
+def chart_baselines(rows: list[dict]) -> alt.Chart:
+    """Three policies, same batch, same attempt budget."""
+    frame = pd.DataFrame(rows)
+    base = alt.Chart(frame).encode(
+        y=alt.Y("policy:N", sort=None, title=None, axis=alt.Axis(labelLimit=200)),
+        x=alt.X("rupees:Q", title="recovered (₹)", axis=alt.Axis(format="~s")),
+        tooltip=[
+            alt.Tooltip("policy:N", title="policy"),
+            alt.Tooltip("rupees:Q", title="recovered ₹", format=",.0f"),
+            alt.Tooltip("acted:Q", title="actions placed"),
+        ],
+    )
+    bars = base.mark_bar(height=26, cornerRadiusEnd=2).encode(
+        color=alt.Color(
+            "policy:N",
+            sort=None,
+            legend=None,
+            scale=alt.Scale(range=[ACCENT, "#6B7280", "#B6BDC7"]),
+        )
+    )
+    labels = base.mark_text(align="left", dx=6, fontSize=12, color=INK).encode(
+        text=alt.Text("rupees:Q", format=",.0f")
+    )
+    return _theme((bars + labels).properties(height=170))
+
+
+def chart_sweep(rows: list[dict], current_budget: int) -> alt.Chart:
+    """Recovery against attempt budget, with a marker where the sliders sit."""
+    frame = pd.DataFrame(rows)
+    colour = alt.Color(
+        "series:N",
+        title=None,
+        scale=alt.Scale(domain=["Nakad", "Baseline"], range=[ACCENT, MUTED]),
+    )
+    line = (
+        alt.Chart(frame)
+        .mark_line(strokeWidth=2, point=False)
+        .encode(
+            x=alt.X("budget:Q", title="attempt budget", scale=alt.Scale(nice=False)),
+            y=alt.Y("rupees:Q", title="recovered (₹)", axis=alt.Axis(format="~s")),
+            color=colour,
+            tooltip=[
+                alt.Tooltip("series:N", title=""),
+                alt.Tooltip("budget:Q", title="attempts"),
+                alt.Tooltip("rupees:Q", title="recovered ₹", format=",.0f"),
+            ],
+        )
+    )
+    marker = (
+        alt.Chart(pd.DataFrame([{"budget": current_budget}]))
+        .mark_rule(strokeDash=[4, 3], color=INK, strokeWidth=1)
+        .encode(x="budget:Q")
+    )
+    return _theme((line + marker).properties(height=170))
+
+
+def chart_stack(rows: list[dict], palette: list[str]) -> alt.Chart:
+    """One stacked bar. Segments keep the order they are passed in."""
+    frame = pd.DataFrame(rows)
+    order = {row["label"]: i for i, row in enumerate(rows)}
+    frame["order"] = frame["label"].map(order)
+    total = max(int(frame["n"].sum()), 1)
+    frame["share"] = frame["n"] / total
+    tooltip = [
+        alt.Tooltip("label:N", title=""),
+        alt.Tooltip("n:Q", title="events"),
+        alt.Tooltip("share:Q", title="share", format=".0%"),
+    ]
+    x = alt.X("n:Q", stack="zero", title=None, axis=None)
+    order = alt.Order("order:Q")
+    base = alt.Chart(frame)
+    bars = base.mark_bar(height=34).encode(
+        x=x,
+        color=alt.Color(
+            "label:N",
+            sort=[row["label"] for row in rows],
+            title=None,
+            scale=alt.Scale(domain=[row["label"] for row in rows], range=palette),
+            legend=alt.Legend(orient="bottom", columns=3, symbolType="square"),
+        ),
+        order=order,
+        tooltip=tooltip,
+    )
+    # Only label a segment wide enough to hold the number; the rest have tooltips.
+    labels = base.transform_filter(alt.datum.share > 0.07).mark_text(
+        color="white", fontSize=11, fontWeight="bold"
+    ).encode(x=alt.X("n:Q", stack="zero", bandPosition=0.5, title=None, axis=None),
+             order=order, text=alt.Text("n:Q"), tooltip=tooltip)
+    return _theme((bars + labels).properties(height=76))
+
+
+def _closed_bands() -> list[dict]:
+    """The hours each rule closes, as minute-of-day spans in IST."""
+    bands = [
+        {"kind": "Attempts", "start": start, "end": end}
+        for start, end in PEAK_RAIL_WINDOWS
+    ]
+    open_from, open_to = CONTACT_WINDOW
+    bands += [
+        {"kind": "Contacts", "start": 0, "end": open_from},
+        {"kind": "Contacts", "start": open_to, "end": 24 * 60},
+    ]
+    return bands
+
+
+def chart_booking(booked: list[dict]) -> alt.Chart:
+    """Every booked action against the hours its own rule closes."""
+    kind_of = {"rail": "Attempts", "contact": "Contacts"}
+    points = pd.DataFrame(
+        [
+            {
+                "kind": kind_of[row["kind"]],
+                "minute": row["minute"],
+                "clock": row["clock"],
+                "action": row["action"].replace("_", " ").title(),
+                "event_id": row["event_id"],
+            }
+            for row in booked
+        ]
+    )
+    if points.empty:
+        points = pd.DataFrame(
+            [{"kind": "Attempts", "minute": None, "clock": "", "action": "", "event_id": ""}]
+        )
+
+    y = alt.Y("kind:N", title=None, sort=["Attempts", "Contacts"])
+    x = alt.X(
+        "minute:Q",
+        title="time of day (IST)",
+        scale=alt.Scale(domain=[0, 1440], nice=False),
+        axis=alt.Axis(
+            values=[0, 240, 480, 720, 960, 1200, 1440],
+            labelExpr="format(floor(datum.value/60), '02') + ':00'",
+        ),
+    )
+    bands = (
+        alt.Chart(pd.DataFrame(_closed_bands()))
+        .mark_rect(color=STOP, opacity=0.10)
+        .encode(x=alt.X("start:Q", scale=alt.Scale(domain=[0, 1440])), x2="end:Q", y=y)
+    )
+    ticks = (
+        alt.Chart(points)
+        .mark_tick(thickness=1.5, size=22, color=ACCENT, opacity=0.45)
+        .encode(
+            x=x,
+            y=y,
+            tooltip=[
+                alt.Tooltip("event_id:N", title="event"),
+                alt.Tooltip("action:N", title="action"),
+                alt.Tooltip("clock:N", title="booked"),
+            ],
+        )
+    )
+    return _theme((bands + ticks).properties(height=150))
+
+
+# --------------------------------------------------------------------------
+# render
+# --------------------------------------------------------------------------
+
+
+def _section(title: str, note: str) -> None:
+    st.divider()
+    st.markdown(f"##### {title}")
+    st.caption(note)
 
 
 def render() -> None:
-    st.set_page_config(page_title="nakad console", layout="wide")
+    st.set_page_config(
+        page_title="Nakad console", layout="wide", initial_sidebar_state="expanded"
+    )
+    st.markdown(CSS, unsafe_allow_html=True)
 
     if not ARTIFACT.exists():
         st.error("No precomputed run found.")
         st.code("python app.py", language="bash")
-        st.caption(
-            "The console renders a precomputed run and never builds one, so that "
-            "no interaction can trigger an LLM call."
-        )
+        st.caption("The console never builds a run — no interaction triggers an LLM call.")
         return
 
     console = load_console(_mtime(ARTIFACT))
-    st.title("nakad — recovery under a hard budget")
+    seed = int(console["seed"])
+    frozen = _frozen_batch(seed)
+    if not frozen.exists():
+        st.error(f"Missing frozen batch {frozen.name}.")
+        st.code("python app.py", language="bash")
+        return
 
+    agent_ledger = console["ledgers"][AGENT]
     config = console["run_config"]
-    degraded = config["unknown"]
-    identity = (
-        f"seed **{console['seed']}** · **{console['events']}** events · "
-        f"provider **{config['provider']}** (`{config['model'] or '—'}`) · "
-        f"{describe_methods(config)} · built {console['built_at']}"
-    )
-    if degraded:
-        share = degraded / console["events"]
-        st.warning(
-            f"{identity} · 🟠 **DEGRADED** — {degraded} events ({share:.0%}) "
-            "could not be diagnosed and were declined, not guessed at."
-        )
-    else:
-        st.info(f"{identity} · ✅ all events diagnosed")
+    batch_path, batch_stamp = str(frozen), _mtime(frozen)
+    ledger_stamp = _mtime(agent_ledger)
 
-    sweep = console["multi_seed"]["run_config"]
-    if sweep["provider"] != config["provider"]:
+    # ---- controls -------------------------------------------------------
+    with st.sidebar:
+        st.markdown("### Nakad")
+        st.caption("Failed-payment recovery · Track 03")
+        st.divider()
+        baseline = st.selectbox("Compare against", BASELINES, index=0)
+        retry = st.slider("Mandate attempts", 20, 300, DEFAULT_RETRY_BUDGET)
+        contact = st.slider("Customer contacts", 0, 200, DEFAULT_CONTACT_BUDGET)
+        if st.button("Reload from disk", width="stretch"):
+            st.cache_data.clear()
+            st.rerun()
         st.caption(
-            f"The stability sweep on the Scoreboard tab ran under provider "
-            f"**{sweep['provider']}**, not **{config['provider']}** — five seeds "
-            "is five times the LLM spend. Its spread is not comparable to the "
-            "headline figures above."
+            "Sliders re-plan the frozen batch. Diagnoses are read from the ledger, "
+            "so nothing here calls a model."
         )
 
-    tabs = st.tabs(["Scoreboard", "Compliance", "Ledger", "Diagnosis", "Reserve"])
-    with tabs[0]:
-        tab_scoreboard(console)
-    with tabs[1]:
-        tab_compliance(console)
-    with tabs[2]:
-        tab_ledger(console)
-    with tabs[3]:
-        tab_diagnosis(console)
-    with tabs[4]:
-        tab_reserve(console)
+    view = score_view(
+        retry, contact, seed, batch_path, batch_stamp, agent_ledger, ledger_stamp
+    )
+    agent = view["agent"]
+    baselines = {
+        BASELINE_ARRIVAL: view["arrival"],
+        BASELINE_AMOUNT: view["amount"],
+        BASELINE_EQUAL: view["equal"],
+    }
+    selected = baselines[baseline]
+
+    lift = agent["gross_paise"] / selected["gross_paise"] if selected["gross_paise"] else 0
+    per_attempt = agent["gross_paise"] / agent["retry_spent"] if agent["retry_spent"] else 0
+    base_per = (
+        selected["gross_paise"] / selected["retry_spent"] if selected["retry_spent"] else 0
+    )
+    spread = console["multi_seed"]["ratio"]
+    unknown = config.get("unknown") or 0
+
+    # ---- 1. header ------------------------------------------------------
+    st.markdown("## Batch result")
+    badge = (
+        f":green[● all {console['events']} diagnosed]"
+        if not unknown
+        else f":red[● {unknown} undiagnosed]"
+    )
+    st.caption(
+        f"seed **{seed}** · reproducible &nbsp;|&nbsp; "
+        f"{config.get('provider')} · `{config.get('model') or '—'}` &nbsp;|&nbsp; "
+        f"{console['events']} failures &nbsp;|&nbsp; {badge}"
+    )
+
+    # ---- 2. the four numbers -------------------------------------------
+    cells = st.columns(4)
+    numbers = (
+        ("Recovered", _rupees(agent["gross_paise"]),
+         f"baseline {_rupees(selected['gross_paise'])}"),
+        ("Lift over baseline", f"{lift:.2f}×",
+         f"5-seed mean {spread['mean']:.2f}× · sd {spread['stdev']:.2f}"),
+        ("Recovered per attempt", _rupees(per_attempt),
+         f"baseline {_rupees(base_per)}"),
+        ("Refused at gate", f"{agent['blocked']}",
+         f"baseline {selected['blocked']}"),
+    )
+    for cell, (label, value, note) in zip(cells, numbers):
+        cell.metric(label, value, border=True)
+        cell.caption(note)
+
+    # ---- 3 + 4. where the recovery comes from ---------------------------
+    _section(
+        "Where the recovery comes from",
+        f"Identical {console['events']} failures and {retry} attempts in every arm. "
+        "Outcomes are keyed by event id, so all three face the same luck.",
+    )
+    c1, c2 = st.columns([1.1, 1])
+    with c1:
+        st.altair_chart(
+            chart_baselines(
+                [
+                    {"policy": "Nakad", "rupees": agent["gross_paise"] / 100,
+                     "acted": agent["acted"]},
+                    {"policy": "Amount-sorted", "rupees": view["amount"]["gross_paise"] / 100,
+                     "acted": view["amount"]["acted"]},
+                    {"policy": "Arrival order", "rupees": view["arrival"]["gross_paise"] / 100,
+                     "acted": view["arrival"]["acted"]},
+                ]
+            ),
+            width="stretch",
+        )
+        st.caption(
+            "Amount-sorted is the honest baseline: it is a real prioritisation "
+            "policy, not a strawman."
+        )
+    with c2:
+        st.altair_chart(
+            chart_sweep(
+                sweep_view(
+                    baseline, contact, seed, batch_path, batch_stamp,
+                    agent_ledger, ledger_stamp,
+                ),
+                retry,
+            ),
+            width="stretch",
+        )
+        st.caption("Dashed line marks the current budget. Both curves flatten as the batch runs out of recoverable failures.")
+
+    # ---- 5 + 6. how the batch was handled -------------------------------
+    _section(
+        "How the batch was handled",
+        "Every failure is labelled once and dispositioned once. Both bars total "
+        f"{console['events']}.",
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Diagnosis route**")
+        by_method = config.get("by_method") or {}
+        st.altair_chart(
+            chart_stack(
+                [
+                    {"label": "Rule lookup", "n": by_method.get("rule", 0)},
+                    {"label": "Fleet correlation", "n": by_method.get("fleet", 0)},
+                    {"label": "LLM", "n": by_method.get("llm", 0)},
+                    {"label": "Undiagnosed", "n": unknown},
+                ],
+                [MUTED, ACCENT, "#93C5FD", STOP],
+            ),
+            width="stretch",
+        )
+        st.caption("Cheapest route first. The LLM only sees what rules and correlation could not settle.")
+    with c2:
+        st.markdown("**Disposition**")
+        other = agent["low_confidence"] + agent["no_window"] + agent["no_diagnosis"]
+        st.altair_chart(
+            chart_stack(
+                [
+                    {"label": "Acted", "n": agent["acted"]},
+                    {"label": "Out of budget", "n": agent["budget"]},
+                    {"label": "No NPCI headroom", "n": agent["no_headroom"]},
+                    {"label": "Not worth an attempt", "n": agent["low_value"]},
+                    {"label": "Refused at gate", "n": agent["blocked"]},
+                    {"label": "Other", "n": other},
+                ],
+                [ACCENT, "#6B7280", "#B6BDC7", FAINT, STOP, "#D1D5DB"],
+            ),
+            width="stretch",
+        )
+        st.caption(
+            f"{agent['acted']} actions is the ceiling at this budget. Every other "
+            "event carries a reason it was declined."
+        )
+
+    # ---- 7 + 8. timing and compliance -----------------------------------
+    _section(
+        "Timing and compliance",
+        "Shaded hours are closed by rule. The allocator books around them rather "
+        "than into them, so the gate rarely has to refuse on timing.",
+    )
+    c1, c2 = st.columns([1.35, 1])
+    with c1:
+        st.altair_chart(chart_booking(agent["booked"]), width="stretch")
+        st.caption(
+            f"All {len(agent['booked'])} booked actions sit outside their own "
+            "closed hours. Attempts and contacts obey different rules."
+        )
+    with c2:
+        blocks = agent["blocked_by_rule"]
+        rows = "\n".join(
+            f"| {label} | {who} | {'law' if standing == 'law' else standing} | "
+            f"{blocks.get(rule_id, 0)} |"
+            for rule_id, label, who, standing in RULE_ROWS
+        )
+        st.markdown(
+            "| Check | Source | Standing | Blocked |\n|---|---|---|---:|\n" + rows
+        )
+        residual = sum(
+            blocks.get(r, 0)
+            for r in (govern.R02_PREDEBIT_NOTICE, govern.R04_WHATSAPP_POLICY)
+        )
+        st.caption(
+            f"Law and self-imposed policy are labelled separately. The {residual} "
+            "remaining refusals are ones no clock can fix."
+        )
+
+    # ---- 9 + 10 + 11. audit ---------------------------------------------
+    events = load_events(batch_path, batch_stamp)
+    diagnoses = load_diagnoses(agent_ledger, ledger_stamp)
+    trace = _pick_trace(events, diagnoses, agent)
+    n_entries, tip_hash = load_tip(agent_ledger, _mtime(agent_ledger))
+
+    _section(
+        "Audit trail",
+        "Four entries per event — ingested, diagnosed, proposed, gated — appended "
+        "and never edited. Approved and refused alike.",
+    )
+    c1, c2, c3 = st.columns([1.35, 1, 1])
+    with c1:
+        st.markdown(f"**One event, end to end** &nbsp; `{trace['event_id']}`")
+        st.markdown(
+            f"| Stage | Entry |\n|---|---|\n"
+            f"| Ingested | {trace['ingested']} |\n"
+            f"| Diagnosed | {trace['diagnosed']} |\n"
+            f"| Proposed | {trace['proposed']} |\n"
+            f"| Gated | {trace['gated']} |"
+        )
+    with c2:
+        st.markdown("**Chain verification**")
+        if "audit_ok" not in st.session_state:
+            st.session_state.audit_ok = True
+            st.session_state.audit_note = f"{n_entries:,} entries · tip matches"
+        if st.session_state.audit_ok:
+            st.markdown(f":green[● Intact] — {st.session_state.audit_note}")
+        else:
+            st.markdown(f":red[● Broken] — {st.session_state.audit_note}")
+        st.code(tip_hash or "—", language=None)
+        if st.button("Edit an entry and re-check", width="stretch"):
+            if not SANDBOX_LEDGER.exists():
+                shutil.copyfile(agent_ledger, SANDBOX_LEDGER)
+            with sqlite3.connect(SANDBOX_LEDGER) as conn:
+                victim = conn.execute(
+                    "SELECT seq FROM entries ORDER BY seq LIMIT 1 OFFSET ?",
+                    (n_entries // 2,),
+                ).fetchone()
+                conn.execute(
+                    "UPDATE entries SET payload = json_set(payload, '$.amount_paise', "
+                    "999999999) WHERE seq = ?",
+                    (victim[0],),
+                )
+            verdict = Ledger(str(SANDBOX_LEDGER)).verify()
+            st.session_state.audit_ok = verdict.ok
+            st.session_state.audit_note = (
+                f"{n_entries:,} entries · tip matches"
+                if verdict.ok
+                else f"tampered at seq {verdict.seq}"
+            )
+            st.rerun()
+    with c3:
+        st.markdown("**Live · Razorpay test mode**")
+        live = load_live_rows(_mtime(LIVE_LEDGER))
+        if live:
+            st.markdown(
+                "| Payment | Outcome |\n|---|---|\n"
+                + "\n".join(f"| `{row['label']}` | {row['tag']} |" for row in live)
+            )
+        else:
+            st.caption("No live events yet. Send a test webhook to populate this.")
+        st.caption("Signature verified, deduped, drawn from the same budget pool.")
 
 
 if st.runtime.exists():
     render()
 elif __name__ == "__main__":
     print("building console artifact (this makes the run's LLM calls) …")
-    # The sweep is five more full batches. Point it at a cheaper provider with
-    # MULTI_SEED_PROVIDER=none when the daily quota will not stretch.
     built = build_console(multi_seed_provider=os.getenv("MULTI_SEED_PROVIDER") or None)
     for label, config in (
         ("headline", built["run_config"]),

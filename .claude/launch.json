@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "nakad-console",
+      "runtimeExecutable": ".venv/bin/streamlit",
+      "runtimeArgs": ["run", "app.py", "--server.port", "8502", "--server.headless", "true"],
+      "port": 8502
+    }
+  ]
+}
