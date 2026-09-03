@@ -8,6 +8,14 @@ Never re-serialise the body for signature verification. Razorpay signs the
 exact bytes it sends; ``json.loads`` then ``json.dumps`` changes whitespace
 and key order and the HMAC will not match even though the payload is logically
 the same. Read ``await request.body()``, verify that, then parse once.
+
+This path allocates one event at a time, which is a degenerate case of the
+batch policy rather than an equivalent of it: with a single candidate there is
+no ranking, only an admission decision against whatever budget is left. That
+decision is worth nothing unless the budget persists between requests, so the
+remaining allowance and the per-mandate attempt count both live in
+``LiveBudget``, in the same database file as the ledger. See allocate.py's
+module docstring.
 """
 
 from __future__ import annotations
@@ -15,14 +23,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 from razorpay.errors import SignatureVerificationError
 from razorpay.utility import Utility
 
@@ -30,12 +39,16 @@ from ledger import Ledger
 from models import Diagnosis, FailureEvent, GateDecision, ProposedAction
 from pipeline import govern
 from pipeline.allocate import (
+    CONTACT_POOL,
     DEFAULT_CONTACT_BUDGET,
     DEFAULT_RETRY_BUDGET,
+    RETRY_POOL,
     allocate,
+    budget_pool,
     index_score,
 )
 from pipeline.diagnose import diagnose_batch
+from pipeline.govern import RAIL_ACTIONS, to_ist
 from run import (
     ENTRY_DIAGNOSED,
     ENTRY_GATED,
@@ -71,9 +84,34 @@ METHOD_MAP = {
     "emandate": "nach",
 }
 
-_seen_event_ids: set[str] = set()
+# A payload we cannot parse or map will fail identically on every redelivery,
+# so retrying it burns Razorpay's 24-hour retry budget to no purpose. Anything
+# else — a locked database, a provider timeout, a bug — may well succeed next
+# time and must be left for redelivery instead of being acknowledged away.
+UNPROCESSABLE_ERRORS = (ValueError, KeyError, TypeError, ValidationError)
+
+OUTCOME_PROCESSED = "processed"
+OUTCOME_ACKNOWLEDGED = "acknowledged"
+OUTCOME_UNPROCESSABLE = "unprocessable"
+
+# Razorpay stops retrying after 24 hours, so a row older than that can never
+# match a redelivery and is only taking up space.
+DEDUPE_RETENTION = timedelta(hours=48)
+PRUNE_EVERY = 500
+
+# Budget the live path may spend inside BUDGET_WINDOW. The batch numbers are
+# per 500-event batch; reused here as a rolling daily allowance so a live event
+# competes against what has actually been spent rather than an empty pool.
+BUDGET_WINDOW = timedelta(hours=24)
+
+# Where the attempt count for the NPCI cap came from.
+SOURCE_LEDGER = "ledger"
+SOURCE_PAYLOAD = "payload"
+
 _live_feed: deque[LiveRecord] = deque(maxlen=20)
 _ledger: Ledger | None = None
+_seen: SeenEvents | None = None
+_budget: LiveBudget | None = None
 
 
 class LiveRecord(BaseModel):
@@ -95,12 +133,206 @@ class LiveRecord(BaseModel):
     pipeline_error: str | None = None
 
 
+class SeenEvents:
+    """Webhook dedupe keyed by Razorpay's event id, on disk.
+
+    Razorpay delivers at least once, so the same id can arrive minutes later
+    during a retry or hours later after a redeploy. An in-memory set forgets
+    everything on restart — reprocessing a whole retry burst — and grows
+    without bound in a long-lived process. A table does neither.
+
+    Shares the live ledger's database file: one artifact to ship, and the
+    dedupe record cannot end up on a different disk from the trail it guards.
+    """
+
+    def __init__(self, db_path: str) -> None:
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        # check_same_thread=False: the connection is cached across requests and
+        # a threaded server may not hand every one to the thread that opened it.
+        # Safe because sqlite3.threadsafety is 3 (serialized), which serialises
+        # access to a single connection.
+        self._conn = sqlite3.connect(
+            db_path, isolation_level=None, check_same_thread=False
+        )
+        # Ledger.append holds this file's write lock under BEGIN IMMEDIATE.
+        # Wait for it rather than raising "database is locked" mid-webhook.
+        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS seen_events (
+              event_id TEXT PRIMARY KEY,
+              seen_at TEXT NOT NULL,
+              outcome TEXT NOT NULL
+            )
+            """
+        )
+        self._marks = 0
+        self.prune()
+
+    def __contains__(self, event_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM seen_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return row is not None
+
+    def outcome_of(self, event_id: str) -> str | None:
+        row = self._conn.execute(
+            "SELECT outcome FROM seen_events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def mark(self, event_id: str, outcome: str) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO seen_events (event_id, seen_at, outcome) "
+            "VALUES (?, ?, ?)",
+            (event_id, datetime.now(timezone.utc).isoformat(), outcome),
+        )
+        self._marks += 1
+        if self._marks % PRUNE_EVERY == 0:
+            self.prune()
+
+    def prune(self, older_than: timedelta = DEDUPE_RETENTION) -> int:
+        """Drop rows past Razorpay's retry horizon. Returns the number removed."""
+        cutoff = (datetime.now(timezone.utc) - older_than).isoformat()
+        cursor = self._conn.execute(
+            "DELETE FROM seen_events WHERE seen_at < ?", (cutoff,)
+        )
+        return cursor.rowcount
+
+    def close(self) -> None:
+        self._conn.close()
+
+
+def mandate_cycle(event: FailureEvent) -> str:
+    """The mandate cycle this failure falls in.
+
+    ponytail: the IST calendar month, not the real cycle. NPCI's cap is per
+    mandate cycle, whose boundaries come from the subscription's billing anchor
+    — a mandate charged on the 20th runs the 20th to the 19th, not the 1st to
+    the 31st. The webhook does not carry the anchor. Consequence: a failure
+    either side of a month boundary looks like a fresh cycle when it is not, so
+    the cap can be over-granted once per mandate per month. Upgrade path is to
+    read the anchor from the Subscriptions API and bucket from there.
+    """
+    return to_ist(event.occurred_at).strftime("%Y-%m")
+
+
+class LiveBudget:
+    """Durable scarcity for the live path, in the ledger's database file.
+
+    Without this every webhook is allocated against a full, untouched budget,
+    so ten thousand webhooks produce ten thousand approvals and the constraint
+    the whole policy is built around does not exist outside the batch run.
+
+    Two pieces of state:
+
+    * ``mandate_attempts`` — attempts *this system* has placed, per mandate per
+      cycle. This is the trustworthy source for the NPCI cap. The alternative,
+      ``payment.notes.retries_used``, is a merchant-controlled free-text field,
+      which means the one genuinely binding rule in the gate would be enforced
+      against input the merchant can set to zero.
+    * ``budget_spend`` — one row per unit actually placed, so a rolling window
+      can be counted. Rows, not a counter, because a counter cannot expire.
+    """
+
+    def __init__(self, db_path: str) -> None:
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(
+            db_path, isolation_level=None, check_same_thread=False
+        )
+        self._conn.execute("PRAGMA busy_timeout = 5000")
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS mandate_attempts (
+              subscription_id TEXT NOT NULL,
+              cycle TEXT NOT NULL,
+              attempts INTEGER NOT NULL,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (subscription_id, cycle)
+            )
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS budget_spend (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              pool TEXT NOT NULL,
+              event_id TEXT NOT NULL,
+              spent_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def attempts_for(self, subscription_id: str | None, cycle: str) -> int | None:
+        """Attempts recorded against this mandate cycle, or None if we have none."""
+        if not subscription_id:
+            return None
+        row = self._conn.execute(
+            "SELECT attempts FROM mandate_attempts "
+            "WHERE subscription_id = ? AND cycle = ?",
+            (subscription_id, cycle),
+        ).fetchone()
+        return int(row[0]) if row else None
+
+    def record_attempt(self, subscription_id: str | None, cycle: str) -> int:
+        """Count one rail attempt against the mandate. Returns the new total."""
+        if not subscription_id:
+            return 0
+        self._conn.execute(
+            """
+            INSERT INTO mandate_attempts (subscription_id, cycle, attempts, updated_at)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(subscription_id, cycle) DO UPDATE SET
+              attempts = attempts + 1, updated_at = excluded.updated_at
+            """,
+            (subscription_id, cycle, datetime.now(timezone.utc).isoformat()),
+        )
+        return self.attempts_for(subscription_id, cycle) or 0
+
+    def spent(self, pool: str, window: timedelta = BUDGET_WINDOW) -> int:
+        cutoff = (datetime.now(timezone.utc) - window).isoformat()
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM budget_spend WHERE pool = ? AND spent_at >= ?",
+            (pool, cutoff),
+        ).fetchone()
+        return int(row[0])
+
+    def remaining(self, pool: str, limit: int) -> int:
+        return max(0, limit - self.spent(pool))
+
+    def record_spend(self, pool: str, event_id: str) -> None:
+        self._conn.execute(
+            "INSERT INTO budget_spend (pool, event_id, spent_at) VALUES (?, ?, ?)",
+            (pool, event_id, datetime.now(timezone.utc).isoformat()),
+        )
+
+    def prune(self, older_than: timedelta = BUDGET_WINDOW) -> int:
+        """Drop spend rows that have aged out of the window."""
+        cutoff = (datetime.now(timezone.utc) - older_than).isoformat()
+        return self._conn.execute(
+            "DELETE FROM budget_spend WHERE spent_at < ?", (cutoff,)
+        ).rowcount
+
+    def close(self) -> None:
+        self._conn.close()
+
+
 def reset_live_state() -> None:
-    """Clear dedupe memory and the feed. For tests only."""
-    global _ledger
-    _seen_event_ids.clear()
+    """Drop cached handles and the feed. For tests only.
+
+    Does not delete the dedupe or budget tables: surviving a restart is the
+    point, and a test that wants a clean slate should point LIVE_LEDGER_PATH at
+    a new file.
+    """
+    global _ledger, _seen, _budget
     _live_feed.clear()
     _ledger = None
+    if _seen is not None:
+        _seen.close()
+    _seen = None
+    if _budget is not None:
+        _budget.close()
+    _budget = None
 
 
 def _ledger_instance() -> Ledger:
@@ -109,6 +341,20 @@ def _ledger_instance() -> Ledger:
         Path(LIVE_LEDGER_PATH).parent.mkdir(parents=True, exist_ok=True)
         _ledger = Ledger(LIVE_LEDGER_PATH)
     return _ledger
+
+
+def _seen_events() -> SeenEvents:
+    global _seen
+    if _seen is None:
+        _seen = SeenEvents(LIVE_LEDGER_PATH)
+    return _seen
+
+
+def _live_budget() -> LiveBudget:
+    global _budget
+    if _budget is None:
+        _budget = LiveBudget(LIVE_LEDGER_PATH)
+    return _budget
 
 
 def verify_webhook_signature(raw_body: bytes, signature: str, secret: str) -> None:
@@ -247,7 +493,11 @@ def failure_event_from_webhook(
         occurred_at=occurred_at,
         retries_used=int(retries_used),
         days_since_mandate_created=DEFAULT_DAYS_SINCE_MANDATE,
-        day_of_month=occurred_at.astimezone(timezone.utc).day,
+        # IST, not UTC: allocate's PAYDAY_DAYS models Indian salary credits, so
+        # the day that matters is the local one. A 06:00 IST failure on the 6th
+        # is still the 5th in UTC, which would swap PAYDAY_UPLIFT for
+        # MID_MONTH_PENALTY — a 0.45 swing on INSUFFICIENT_FUNDS.
+        day_of_month=to_ist(occurred_at).day,
         issuer_recent_failure_rate=DEFAULT_ISSUER_FAILURE_RATE,
         amount_vs_customer_avg=DEFAULT_AMOUNT_VS_AVG,
         true_cause=None,
@@ -264,6 +514,7 @@ def write_live_trace(
     action: ProposedAction,
     decision: GateDecision,
     score: float,
+    attempts_source: str = SOURCE_PAYLOAD,
 ) -> None:
     """Four ledger entries per event, matching the batch orchestrator."""
     ledger.append(
@@ -280,6 +531,9 @@ def write_live_trace(
             "error_code": event.error_code,
             "error_reason": event.error_reason,
             "retries_used": event.retries_used,
+            # Which count the NPCI cap was enforced against. "payload" means a
+            # merchant-controlled field; "ledger" means our own attempt record.
+            "retries_used_source": attempts_source,
             "occurred_at": event.occurred_at,
             "provenance": provenance,
         },
@@ -327,17 +581,58 @@ def process_failure_event(
     """Run one event through diagnose → allocate → govern and append the ledger."""
     received_at = datetime.now(timezone.utc)
     try:
+        budget = _live_budget()
+        cycle = mandate_cycle(event)
+
+        # Our own count wins over payment.notes, which the merchant controls.
+        # Falling back to the payload is only for a mandate we have never seen;
+        # from the first attempt we place, we are the authority.
+        claimed = event.retries_used
+        recorded = budget.attempts_for(event.subscription_id, cycle)
+        attempts_source = SOURCE_PAYLOAD if recorded is None else SOURCE_LEDGER
+        if recorded is None:
+            provenance["retries_used"] = (
+                f"{claimed} from payment.notes (merchant-controlled); no attempt "
+                f"recorded for {event.subscription_id} in cycle {cycle} yet"
+            )
+        else:
+            event = event.model_copy(update={"retries_used": recorded})
+            provenance["retries_used"] = (
+                f"{recorded} from our own attempt record for cycle {cycle}; "
+                f"payment.notes claimed {claimed}"
+            )
+            if recorded != claimed:
+                log.info(
+                    "mandate %s cycle %s: enforcing cap against recorded %d, "
+                    "not payload %d",
+                    event.subscription_id,
+                    cycle,
+                    recorded,
+                    claimed,
+                )
+
         diagnoses, _ = diagnose_batch([event])
         diagnosis = diagnoses[0]
+        # Remaining budget, not the full allowance: see allocate's module
+        # docstring on why one event against a fresh pool decides nothing.
         actions, _ = allocate(
             [event],
             diagnoses,
-            DEFAULT_RETRY_BUDGET,
-            DEFAULT_CONTACT_BUDGET,
+            budget.remaining(RETRY_POOL, DEFAULT_RETRY_BUDGET),
+            budget.remaining(CONTACT_POOL, DEFAULT_CONTACT_BUDGET),
         )
         action = actions[0]
         decision = govern.evaluate(action, gate_context_for(event, action))
         score, _ = index_score(event, diagnosis)
+
+        # Spend is recorded only for an action that cleared the gate, matching
+        # the batch path where a blocked action's budget is reclaimed.
+        pool = budget_pool(action.action)
+        if decision.approved and pool is not None:
+            budget.record_spend(pool, event.event_id)
+            if action.action in RAIL_ACTIONS:
+                budget.record_attempt(event.subscription_id, cycle)
+
         write_live_trace(
             _ledger_instance(),
             event,
@@ -347,6 +642,7 @@ def process_failure_event(
             action,
             decision,
             score,
+            attempts_source,
         )
         record = LiveRecord(
             razorpay_event_id=razorpay_event_id,
@@ -363,17 +659,23 @@ def process_failure_event(
         )
     except Exception as exc:
         log.exception("pipeline failed for %s", event.event_id)
-        record = LiveRecord(
-            razorpay_event_id=razorpay_event_id,
-            razorpay_event_type=razorpay_event_type,
-            event_id=event.event_id,
-            payment_id=event.payment_id,
-            amount_paise=event.amount_paise,
-            method=event.method,
-            received_at=received_at,
-            provenance=provenance,
-            pipeline_error=str(exc),
+        _live_feed.appendleft(
+            LiveRecord(
+                razorpay_event_id=razorpay_event_id,
+                razorpay_event_type=razorpay_event_type,
+                event_id=event.event_id,
+                payment_id=event.payment_id,
+                amount_paise=event.amount_paise,
+                method=event.method,
+                received_at=received_at,
+                provenance=provenance,
+                pipeline_error=str(exc),
+            )
         )
+        # Re-raised so the caller can decide whether Razorpay should redeliver.
+        # Swallowing here returned 200 on a transient fault, which told Razorpay
+        # the event was handled and dropped it for good.
+        raise
     _live_feed.appendleft(record)
     return record
 
@@ -408,37 +710,66 @@ async def webhook(
     except SignatureVerificationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if x_razorpay_event_id in _seen_event_ids:
-        log.info("duplicate webhook %s — acknowledging without reprocessing", x_razorpay_event_id)
+    seen = _seen_events()
+    if x_razorpay_event_id in seen:
+        log.info(
+            "duplicate webhook %s (already %s) — acknowledging without reprocessing",
+            x_razorpay_event_id,
+            seen.outcome_of(x_razorpay_event_id),
+        )
         return {"status": "duplicate"}
 
-    _seen_event_ids.add(x_razorpay_event_id)
-
+    # Marked seen only on the way out. Marking on the way in meant a transient
+    # fault dropped the event twice over: Razorpay was told 200 and stopped
+    # retrying, and any redelivery that did arrive was rejected as a duplicate.
+    event_type = ""
     try:
         body = json.loads(raw_body)
-    except json.JSONDecodeError as exc:
-        log.exception("malformed webhook body")
-        return {"status": "accepted", "error": "malformed json"}
+        event_type = str(body.get("event") or "")
+        route = _should_process(event_type)
 
-    event_type = str(body.get("event") or "")
-    route = _should_process(event_type)
-
-    if route == "ack":
-        log.info("acknowledged %s (%s)", event_type, x_razorpay_event_id)
-        return {"status": "acknowledged", "event": event_type}
-
-    if route == "ignore":
-        log.info("ignored unknown event %s (%s)", event_type, x_razorpay_event_id)
-        return {"status": "ignored", "event": event_type}
-
-    try:
-        event, provenance = failure_event_from_webhook(event_type, body)
-        process_failure_event(event, provenance, x_razorpay_event_id, event_type)
-    except Exception as exc:
-        log.exception("failed to handle %s", event_type)
+        if route == "ack":
+            outcome, result = OUTCOME_ACKNOWLEDGED, {
+                "status": "acknowledged",
+                "event": event_type,
+            }
+        elif route == "ignore":
+            outcome, result = OUTCOME_ACKNOWLEDGED, {
+                "status": "ignored",
+                "event": event_type,
+            }
+        else:
+            event, provenance = failure_event_from_webhook(event_type, body)
+            process_failure_event(event, provenance, x_razorpay_event_id, event_type)
+            outcome, result = OUTCOME_PROCESSED, {
+                "status": "processed",
+                "event": event_type,
+                "event_id": event.event_id,
+            }
+    except UNPROCESSABLE_ERRORS as exc:
+        seen.mark(x_razorpay_event_id, OUTCOME_UNPROCESSABLE)
+        log.warning(
+            "unprocessable webhook %s (%s): %s — marked seen and acknowledged, "
+            "a redelivery of the same bytes would fail identically",
+            x_razorpay_event_id,
+            event_type or "(unparsed)",
+            exc,
+        )
         return {"status": "accepted", "error": str(exc)}
+    except Exception as exc:
+        log.exception(
+            "transient failure on webhook %s (%s) — left unseen and returning 500 "
+            "so Razorpay redelivers",
+            x_razorpay_event_id,
+            event_type or "(unparsed)",
+        )
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    return {"status": "processed", "event": event_type, "event_id": event.event_id}
+    seen.mark(x_razorpay_event_id, outcome)
+    log.info(
+        "%s webhook %s (%s) — marked seen", outcome, x_razorpay_event_id, event_type
+    )
+    return result
 
 
 @app.get("/live")

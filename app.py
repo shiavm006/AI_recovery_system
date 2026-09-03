@@ -23,7 +23,15 @@ from models import BatchResult
 from pipeline import govern
 from pipeline.diagnose import _load_frozen_batch, diagnose_batch, run_config
 from pipeline.govern import CONTACT_WINDOW, PEAK_RAIL_WINDOWS, to_ist
-from run import AGENT, CONTROL, ENTRY_PROPOSED, POLICIES, TRACE_ENTRY_TYPES, run_batch
+from run import (
+    AGENT,
+    ALL_ENTRY_TYPES,
+    CONTROL,
+    ENTRY_PROPOSED,
+    POLICIES,
+    TRACE_ENTRY_TYPES,
+    run_batch,
+)
 
 DATA = _ROOT / "data"
 ARTIFACT = DATA / "console.json"
@@ -411,7 +419,7 @@ def tab_ledger(console: dict) -> None:
     controls = st.columns([2, 2])
     query = controls[0].text_input("Filter by event id", placeholder="evt_…")
     kinds = controls[1].multiselect(
-        "Entry type", TRACE_ENTRY_TYPES, default=list(TRACE_ENTRY_TYPES)
+        "Entry type", ALL_ENTRY_TYPES, default=list(TRACE_ENTRY_TYPES)
     )
 
     view = frame.loc[frame["entry_type"].isin(kinds)]

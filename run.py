@@ -3,7 +3,7 @@ from __future__ import annotations
 import random
 from collections import Counter
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from ledger import Ledger
@@ -45,6 +45,44 @@ ENTRY_DIAGNOSED = "diagnosed"
 ENTRY_PROPOSED = "proposed"
 ENTRY_GATED = "gated"
 TRACE_ENTRY_TYPES = (ENTRY_INGESTED, ENTRY_DIAGNOSED, ENTRY_PROPOSED, ENTRY_GATED)
+
+# What actually happened when an approved action fired. Every event gets the
+# four trace entries above; only an approved action can get this fifth one, so
+# it is not part of TRACE_ENTRY_TYPES.
+#
+# NOTHING WRITES THIS YET — the simulator computes outcomes in memory and
+# throws them away. The schema exists because BASE_RECOVERY_PROBABILITY's whole
+# claim is that its invented constants get replaced by observed rates, and that
+# is impossible without a durable record of which attempts actually recovered.
+ENTRY_EXECUTED = "executed"
+ALL_ENTRY_TYPES = TRACE_ENTRY_TYPES + (ENTRY_EXECUTED,)
+
+
+def write_execution_outcome(
+    ledger: Ledger,
+    event_id: str,
+    action: ActionType,
+    attempted_at: datetime,
+    succeeded: bool,
+    recovered_paise: int = 0,
+    detail: str | None = None,
+) -> None:
+    """Append the outcome of one approved action.
+
+    Grouping these by the diagnosed cause is what turns
+    BASE_RECOVERY_PROBABILITY from a table of guesses into a measurement.
+    """
+    ledger.append(
+        event_id,
+        ENTRY_EXECUTED,
+        {
+            "action": action.value,
+            "attempted_at": attempted_at,
+            "succeeded": succeeded,
+            "recovered_paise": recovered_paise,
+            "detail": detail,
+        },
+    )
 
 # The fixed offset the control arm retries at. Dunning tools ship a schedule
 # like T+24h/T+72h; we model the first rung only, since the batch is one cycle.

@@ -4,6 +4,19 @@ which failures receive the scarce attempts and which receive none. This is an
 index policy in the spirit of a restless multi-armed bandit; we do not claim a
 proven Whittle index.
 
+SINGLE-EVENT ALLOCATION IS A DEGENERATE CASE, NOT THE BATCH POLICY.
+
+``allocate`` earns its keep by ranking candidates against each other and
+cutting where a pool runs dry. Called with one event it cannot do that: there
+is nothing to out-rank, so every rationale mentioning an "index" or a "cut"
+describes a competition of one. What remains is an admission decision — does
+this event clear the value and confidence floors, and is there budget left —
+and that is only meaningful if the remaining budget is carried across calls.
+Passing the full budget in on every call, as a stateless per-request caller
+naturally would, grants everything and reproduces none of the scarcity the
+policy exists to model. webhook.py therefore passes the *remaining* budget
+from durable state; see its ``LiveBudget``.
+
 No LLM calls, no network calls.
 """
 
