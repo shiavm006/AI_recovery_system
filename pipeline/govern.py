@@ -167,7 +167,6 @@ def r04_whatsapp_policy(action: ProposedAction, ctx: GateContext) -> tuple[bool,
 
 
 def r05_consent(action: ProposedAction, ctx: GateContext) -> tuple[bool, str]:
-    """Block NUDGE and PAYMENT_LINK unless consent is logged."""
     if action.action not in CONTACT_ACTIONS:
         return True, "not a contact action"
     if not ctx.consent_logged:

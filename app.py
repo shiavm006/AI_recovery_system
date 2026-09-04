@@ -456,10 +456,6 @@ def _pick_trace(
     }
 
 
-# --------------------------------------------------------------------------
-# budget sweep
-# --------------------------------------------------------------------------
-
 SWEEP_POINTS = 12
 SWEEP_MIN, SWEEP_MAX = 20, 300
 
@@ -494,11 +490,6 @@ def sweep_view(
             {"budget": budget, "series": "Baseline", "rupees": base["gross_paise"] / 100}
         )
     return rows
-
-
-# --------------------------------------------------------------------------
-# charts — Altair, so axes, tooltips and resizing come for free
-# --------------------------------------------------------------------------
 
 
 def _theme(chart: alt.Chart) -> alt.Chart:
@@ -676,11 +667,6 @@ def chart_booking(booked: list[dict]) -> alt.Chart:
     return _theme((bands + ticks).properties(height=150))
 
 
-# --------------------------------------------------------------------------
-# render
-# --------------------------------------------------------------------------
-
-
 def _section(title: str, note: str) -> None:
     st.divider()
     st.markdown(f"##### {title}")
@@ -712,7 +698,6 @@ def render() -> None:
     batch_path, batch_stamp = str(frozen), _mtime(frozen)
     ledger_stamp = _mtime(agent_ledger)
 
-    # ---- controls -------------------------------------------------------
     with st.sidebar:
         st.markdown("### Nakad")
         st.caption("Failed-payment recovery · Track 03")
@@ -747,7 +732,6 @@ def render() -> None:
     spread = console["multi_seed"]["ratio"]
     unknown = config.get("unknown") or 0
 
-    # ---- 1. header ------------------------------------------------------
     st.markdown("## Batch result")
     badge = (
         f":green[● all {console['events']} diagnosed]"
@@ -760,7 +744,6 @@ def render() -> None:
         f"{console['events']} failures &nbsp;|&nbsp; {badge}"
     )
 
-    # ---- 2. the four numbers -------------------------------------------
     cells = st.columns(4)
     numbers = (
         ("Recovered", _rupees(agent["gross_paise"]),
@@ -776,7 +759,6 @@ def render() -> None:
         cell.metric(label, value, border=True)
         cell.caption(note)
 
-    # ---- 3 + 4. where the recovery comes from ---------------------------
     _section(
         "Where the recovery comes from",
         f"Identical {console['events']} failures and {retry} attempts in every arm. "
@@ -814,7 +796,6 @@ def render() -> None:
         )
         st.caption("Dashed line marks the current budget. Both curves flatten as the batch runs out of recoverable failures.")
 
-    # ---- 5 + 6. how the batch was handled -------------------------------
     _section(
         "How the batch was handled",
         "Every failure is labelled once and dispositioned once. Both bars total "
@@ -859,7 +840,6 @@ def render() -> None:
             "event carries a reason it was declined."
         )
 
-    # ---- 7 + 8. timing and compliance -----------------------------------
     _section(
         "Timing and compliance",
         "Shaded hours are closed by rule. The allocator books around them rather "
@@ -875,7 +855,7 @@ def render() -> None:
     with c2:
         blocks = agent["blocked_by_rule"]
         rows = "\n".join(
-            f"| {label} | {who} | {'law' if standing == 'law' else standing} | "
+            f"| {label} | {who} | {standing} | "
             f"{blocks.get(rule_id, 0)} |"
             for rule_id, label, who, standing in RULE_ROWS
         )
@@ -891,7 +871,6 @@ def render() -> None:
             "remaining refusals are ones no clock can fix."
         )
 
-    # ---- 9 + 10 + 11. audit ---------------------------------------------
     events = load_events(batch_path, batch_stamp)
     diagnoses = load_diagnoses(agent_ledger, ledger_stamp)
     trace = _pick_trace(events, diagnoses, agent)

@@ -1,32 +1,8 @@
-"""Live Razorpay webhook ingress. Test mode only.
+"""Live Razorpay webhook ingress (test mode). Signed body → FailureEvent →
+diagnose → allocate → govern, on a separate ledger.
 
-Receives signed webhooks, maps them onto :class:`FailureEvent`, and runs the
-same diagnose → allocate → govern path as the batch orchestrator. Writes to a
-separate ledger so the demo trail is not mixed with the frozen batch run.
-
-Never re-serialise the body for signature verification. Razorpay signs the
-exact bytes it sends; ``json.loads`` then ``json.dumps`` changes whitespace
-and key order and the HMAC will not match even though the payload is logically
-the same. Read ``await request.body()``, verify that, then parse once.
-
-This path allocates one event at a time, which is a degenerate case of the
-batch policy rather than an equivalent of it: with a single candidate there is
-no ranking, only an admission decision against whatever budget is left. That
-decision is worth nothing unless the budget persists between requests, so the
-remaining allowance and the per-mandate attempt count both live in
-``LiveBudget``, in the same database file as the ledger. See allocate.py's
-module docstring.
-
-Fleet outage correlation also needs more than one event. Each webhook is
-recorded into ``RecentFailures`` and diagnosed against the last
-``OUTAGE_WINDOW_MINUTES`` of traffic; without that buffer the layer pitched as
-requiring batch context silently never fires in production.
-
-Bank identity is resolved from a vendored copy of Razorpay's IFSC bank-code
-map (``data/reference/ifsc-banknames.json``), never from ifsc.razorpay.com at
-runtime. The dataset is Razorpay's own, MIT-licensed code with a public-domain
-dataset, sourced from RBI NEFT/RTGS lists and the NPCI ACH live-banks list —
-see ``data/reference/ifsc-banknames.SOURCE.txt``.
+Verify HMAC on the raw bytes before parsing. Single-event allocation needs
+durable remaining budget — see allocate.py and ``LiveBudget``.
 """
 
 from __future__ import annotations

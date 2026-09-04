@@ -1,23 +1,8 @@
-"""NPCI permits one execution plus three retries per mandate cycle. Recovery is
-therefore a constrained allocation problem, not a schedule — the question is
-which failures receive the scarce attempts and which receive none. This is an
-index policy in the spirit of a restless multi-armed bandit; we do not claim a
-proven Whittle index.
+"""Constrained allocation of scarce NPCI attempts and contacts. No LLM, no network.
 
-SINGLE-EVENT ALLOCATION IS A DEGENERATE CASE, NOT THE BATCH POLICY.
-
-``allocate`` earns its keep by ranking candidates against each other and
-cutting where a pool runs dry. Called with one event it cannot do that: there
-is nothing to out-rank, so every rationale mentioning an "index" or a "cut"
-describes a competition of one. What remains is an admission decision — does
-this event clear the value and confidence floors, and is there budget left —
-and that is only meaningful if the remaining budget is carried across calls.
-Passing the full budget in on every call, as a stateless per-request caller
-naturally would, grants everything and reproduces none of the scarcity the
-policy exists to model. webhook.py therefore passes the *remaining* budget
-from durable state; see its ``LiveBudget``.
-
-No LLM calls, no network calls.
+SINGLE-EVENT CALLS ARE DEGENERATE: one candidate cannot be ranked. Admission
+only means something if remaining budget persists across calls — webhook.py
+passes that via ``LiveBudget``.
 """
 
 from __future__ import annotations
@@ -44,12 +29,12 @@ from pipeline.govern import (
 # ordering as the claim and the magnitudes as placeholders to be replaced by
 # observed outcomes once the ledger has enough history.
 BASE_RECOVERY_PROBABILITY: dict[RootCause, float] = {
-    RootCause.NETWORK_TIMEOUT: 0.80,  # transient gateway fault; nothing is wrong with the payer
-    RootCause.ISSUER_DOWNTIME: 0.75,  # bank-side outage, so the failure was not the customer's
-    RootCause.INSUFFICIENT_FUNDS: 0.45,  # depends on the payer's balance; see the payday terms
-    RootCause.DEAD_MANDATE: 0.35,  # recoverable, but only by re-presenting the mandate
-    RootCause.HARD_DECLINE: 0.02,  # the issuer refused the instrument outright
-    RootCause.RISK_BLOCK: 0.01,  # blocked deliberately; retrying is the wrong answer
+    RootCause.NETWORK_TIMEOUT: 0.80,
+    RootCause.ISSUER_DOWNTIME: 0.75,
+    RootCause.INSUFFICIENT_FUNDS: 0.45,
+    RootCause.DEAD_MANDATE: 0.35,
+    RootCause.HARD_DECLINE: 0.02,
+    RootCause.RISK_BLOCK: 0.01,
     # Not an estimate. UNKNOWN means diagnosis failed, and zero keeps the
     # scoring function total so ranking cannot raise on it; the SUPPRESS
     # mapping below is what actually keeps it away from the budget.
@@ -147,7 +132,6 @@ def _near_payday(day_of_month: int) -> bool:
 
 
 def has_rail_headroom(event: FailureEvent) -> bool:
-    """Whether the mandate has an NPCI attempt left."""
     return event.retries_used < NPCI_RETRY_CAP
 
 
