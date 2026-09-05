@@ -1,4 +1,4 @@
-"""Nakad console. Read-only: renders a precomputed artifact, never calls an LLM.
+"""Nakad console: explore a precomputed run — budgets and baselines, not rebuilds.
 
 Build the artifact with `python app.py`, then `streamlit run app.py`.
 """
@@ -123,8 +123,8 @@ def build_console(seed: int = 42, multi_seed_provider: str | None = None) -> dic
     """Run everything once and write the artifact the console renders."""
     if st.runtime.exists():
         raise RuntimeError(
-            "build_console makes LLM calls and must not run in the render path; "
-            "run `python app.py` first."
+            "build_console belongs offline (`python app.py`); the console only "
+            "renders a finished artifact."
         )
 
     DATA.mkdir(parents=True, exist_ok=True)
@@ -670,17 +670,20 @@ def render() -> None:
     st.markdown(CSS, unsafe_allow_html=True)
 
     if not ARTIFACT.exists():
-        st.error("No precomputed run found.")
+        st.info("The console explores a finished run. Build that run once, then reopen.")
+        st.markdown(f"**Expected artifact:** `{ARTIFACT}`")
         st.code("python app.py", language="bash")
-        st.caption("The console never builds a run — no interaction triggers an LLM call.")
+        st.caption("That writes the artifact; `streamlit run app.py` only renders it.")
         return
 
     console = load_console(_mtime(ARTIFACT))
     seed = int(console["seed"])
     frozen = _frozen_batch(seed)
     if not frozen.exists():
-        st.error(f"Missing frozen batch {frozen.name}.")
+        st.info("The console needs the frozen batch that matches this artifact.")
+        st.markdown(f"**Expected batch:** `{frozen}`")
         st.code("python app.py", language="bash")
+        st.caption("That regenerates the batch and artifact together.")
         return
 
     agent_ledger = console["ledgers"][AGENT]
@@ -695,12 +698,12 @@ def render() -> None:
         baseline = st.selectbox("Compare against", BASELINES, index=0)
         retry = st.slider("Mandate attempts", 20, 300, DEFAULT_RETRY_BUDGET)
         contact = st.slider("Customer contacts", 0, 200, DEFAULT_CONTACT_BUDGET)
-        if st.button("Reload from disk", width="stretch"):
+        if st.button("Reload run", width="stretch"):
             st.cache_data.clear()
             st.rerun()
         st.caption(
-            "Sliders re-plan the frozen batch. Diagnoses are read from the ledger, "
-            "so nothing here calls a model."
+            "Diagnoses are computed once and stored in the ledger. "
+            "Budgets change what we do with them, not what they are."
         )
 
     view = score_view(
@@ -721,6 +724,17 @@ def render() -> None:
     )
     spread = console["multi_seed"]["ratio"]
     unknown = config.get("unknown") or 0
+    by_method = config.get("by_method") or {}
+    llm_events = int(by_method.get("llm") or 0)
+    events_n = int(config.get("events") or console["events"])
+    llm_calls = config.get("llm_calls")
+    if llm_calls is None:
+        model_note = f"{llm_events} of {events_n} events diagnosed by the model"
+    else:
+        model_note = (
+            f"{llm_events} of {events_n} events diagnosed by the model — "
+            f"{int(llm_calls)} API calls after batching and caching"
+        )
 
     st.markdown("## Batch result")
     badge = (
@@ -731,7 +745,8 @@ def render() -> None:
     st.caption(
         f"seed **{seed}** · reproducible &nbsp;|&nbsp; "
         f"{config.get('provider')} · `{config.get('model') or '—'}` &nbsp;|&nbsp; "
-        f"{console['events']} failures &nbsp;|&nbsp; {badge}"
+        f"{console['events']} failures &nbsp;|&nbsp; {badge} &nbsp;|&nbsp; "
+        f"{model_note}"
     )
 
     cells = st.columns(4)

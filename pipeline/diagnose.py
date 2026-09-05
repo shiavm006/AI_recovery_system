@@ -247,6 +247,8 @@ def run_config(diagnoses: list[Diagnosis]) -> dict:
         "by_method": {name: by_method[name] for name in sorted(by_method)},
         "unknown": unknown,
         "degraded": bool(unknown),
+        # Provider round-trips after batching/caching — not event count.
+        "llm_calls": int(_stats["llm_calls"]),
     }
 
 

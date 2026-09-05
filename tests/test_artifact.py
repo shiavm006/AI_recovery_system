@@ -93,14 +93,13 @@ def test_run_config_reports_the_provider_and_method_mix(monkeypatch):
     # The UNKNOWN event is counted as undiagnosed, not as "llm": the LLM layer
     # failed it rather than diagnosing it, and by_method is a record of work
     # done. The buckets still sum to events.
-    assert config == {
-        "provider": "openai",
-        "model": "openai/gpt-oss-120b",
-        "events": 2,
-        "by_method": {"rule": 1, "undiagnosed": 1},
-        "unknown": 1,
-        "degraded": True,
-    }
+    assert config["provider"] == "openai"
+    assert config["model"] == "openai/gpt-oss-120b"
+    assert config["events"] == 2
+    assert config["by_method"] == {"rule": 1, "undiagnosed": 1}
+    assert config["unknown"] == 1
+    assert config["degraded"] is True
+    assert "llm_calls" in config
     assert sum(config["by_method"].values()) == config["events"]
 
 
