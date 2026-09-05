@@ -120,7 +120,6 @@ def in_contact_hours(stamp: datetime) -> bool:
 
 
 def r01_rail_cap(action: ProposedAction, ctx: GateContext) -> tuple[bool, str]:
-    """Block RETRY/MANDATE_REPRESENT at NPCI retry cap or in peak IST windows."""
     if action.action not in RAIL_ACTIONS:
         return True, "not a rail action"
     if ctx.retries_used >= NPCI_RETRY_CAP:
@@ -134,7 +133,6 @@ def r01_rail_cap(action: ProposedAction, ctx: GateContext) -> tuple[bool, str]:
 
 
 def r02_predebit_notice(action: ProposedAction, ctx: GateContext) -> tuple[bool, str]:
-    """Block MANDATE_REPRESENT unless a notice was sent at least 24 hours ago."""
     if action.action is not ActionType.MANDATE_REPRESENT:
         return True, "not mandate represent"
     if ctx.last_notice_sent_at is None:
@@ -145,20 +143,14 @@ def r02_predebit_notice(action: ProposedAction, ctx: GateContext) -> tuple[bool,
 
 
 def r03_dlt_template(action: ProposedAction, ctx: GateContext) -> tuple[bool, str]:
-    """Block SMS/voice when no registered DLT template is indicated.
-
-    GateContext has no template field, so SMS/voice always fail this rule.
-    """
+    # GateContext has no template field, so SMS/voice always fail this rule.
     if ctx.channel not in DLT_CHANNELS:
         return True, "not an SMS/voice channel"
     return False, "no registered DLT template indicated"
 
 
 def r04_whatsapp_policy(action: ProposedAction, ctx: GateContext) -> tuple[bool, str]:
-    """Block WhatsApp unless consent is logged.
-
-    WhatsApp is governed by Meta's business messaging policy, not TRAI DLT.
-    """
+    # Meta business messaging policy, not TRAI DLT.
     if ctx.channel != "whatsapp":
         return True, "not whatsapp"
     if not ctx.consent_logged:
@@ -175,11 +167,7 @@ def r05_consent(action: ProposedAction, ctx: GateContext) -> tuple[bool, str]:
 
 
 def r06_quiet_hours(action: ProposedAction, ctx: GateContext) -> tuple[bool, str]:
-    """Block contact actions outside 08:00–18:59 IST inclusive.
-
-    This is our voluntary policy modelled on RBI recovery-agent norms,
-    not a law binding on merchants.
-    """
+    # Voluntary policy modelled on RBI recovery-agent norms — not binding on merchants.
     if action.action not in CONTACT_ACTIONS:
         return True, "not a contact action"
     if not in_contact_hours(ctx.now):
@@ -188,7 +176,6 @@ def r06_quiet_hours(action: ProposedAction, ctx: GateContext) -> tuple[bool, str
 
 
 def r07_halt(action: ProposedAction, ctx: GateContext) -> tuple[bool, str]:
-    """Block every action if the customer asked to stop, promised to pay, or disputed."""
     if ctx.stop_requested:
         return False, "stop requested"
     if ctx.promise_to_pay:

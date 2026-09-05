@@ -80,15 +80,13 @@ BASELINE_AMOUNT = "Amount-sorted queue"
 BASELINE_EQUAL = "Equal total actions"
 BASELINES = (BASELINE_ARRIVAL, BASELINE_AMOUNT, BASELINE_EQUAL)
 
-# rule id, short label, who imposes it, binding or self-imposed
 RULE_ROWS = (
     (govern.R01_RAIL_CAP, "Attempt cap", "NPCI", "law"),
     (govern.R02_PREDEBIT_NOTICE, "24-hour notice", "RBI", "law"),
-    (govern.R04_WHATSAPP_POLICY, "Consent", "Meta", "contract"),
+    (govern.R04_WHATSAPP_POLICY, "WhatsApp policy", "Meta", "contract"),
     (govern.R06_QUIET_HOURS, "Quiet hours", "Nakad", "policy"),
 )
 
-# One accent, one warning, everything else grey. Charts and text share it.
 INK = "#111827"
 ACCENT = "#2563EB"
 MUTED = "#9CA3AF"
@@ -96,8 +94,7 @@ FAINT = "#E5E7EB"
 GOOD = "#059669"
 STOP = "#DC2626"
 
-# Streamlit ships its own chrome; this only trims what we never use and sets
-# the numeric font. No layout overrides, so a Streamlit upgrade cannot break it.
+# Trim Streamlit chrome only — no layout overrides (upgrade-safe).
 CSS = """
 <style>
 #MainMenu, footer, [data-testid="stDecoration"] {display: none;}
@@ -376,7 +373,6 @@ def score_view(
     ledger_path: str,
     ledger_stamp: float,
 ) -> dict:
-    """Recompute agent + baselines from frozen diagnoses. No LLM."""
     events = load_events(batch_path, batch_stamp)
     diagnoses = load_diagnoses(ledger_path, ledger_stamp)
     agent = _score(
@@ -470,7 +466,6 @@ def sweep_view(
     ledger_path: str,
     ledger_stamp: float,
 ) -> list[dict]:
-    """Recovery as the attempt budget varies. Frozen diagnoses, no LLM."""
     events = load_events(batch_path, batch_stamp)
     diagnoses = load_diagnoses(ledger_path, ledger_stamp)
     propose_agent = _propose_agent(diagnoses)
@@ -512,7 +507,6 @@ def _theme(chart: alt.Chart) -> alt.Chart:
 
 
 def chart_baselines(rows: list[dict]) -> alt.Chart:
-    """Three policies, same batch, same attempt budget."""
     frame = pd.DataFrame(rows)
     base = alt.Chart(frame).encode(
         y=alt.Y("policy:N", sort=None, title=None, axis=alt.Axis(labelLimit=200)),
@@ -538,7 +532,6 @@ def chart_baselines(rows: list[dict]) -> alt.Chart:
 
 
 def chart_sweep(rows: list[dict], current_budget: int) -> alt.Chart:
-    """Recovery against attempt budget, with a marker where the sliders sit."""
     frame = pd.DataFrame(rows)
     colour = alt.Color(
         "series:N",
@@ -568,7 +561,6 @@ def chart_sweep(rows: list[dict], current_budget: int) -> alt.Chart:
 
 
 def chart_stack(rows: list[dict], palette: list[str]) -> alt.Chart:
-    """One stacked bar. Segments keep the order they are passed in."""
     frame = pd.DataFrame(rows)
     order = {row["label"]: i for i, row in enumerate(rows)}
     frame["order"] = frame["label"].map(order)
@@ -603,7 +595,6 @@ def chart_stack(rows: list[dict], palette: list[str]) -> alt.Chart:
 
 
 def _closed_bands() -> list[dict]:
-    """The hours each rule closes, as minute-of-day spans in IST."""
     bands = [
         {"kind": "Attempts", "start": start, "end": end}
         for start, end in PEAK_RAIL_WINDOWS
@@ -617,7 +608,6 @@ def _closed_bands() -> list[dict]:
 
 
 def chart_booking(booked: list[dict]) -> alt.Chart:
-    """Every booked action against the hours its own rule closes."""
     kind_of = {"rail": "Attempts", "contact": "Contacts"}
     points = pd.DataFrame(
         [

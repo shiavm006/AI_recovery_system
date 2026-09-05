@@ -92,7 +92,6 @@ _stats: dict = {
 
 
 def _is_bank_issuer(issuer: str) -> bool:
-    """Whether ``issuer`` names an issuing bank we can correlate on."""
     return bool(issuer) and issuer != UNKNOWN_ISSUER and not issuer.startswith(
         PSP_ISSUER_PREFIX
     )
@@ -203,12 +202,7 @@ def _provider_name() -> str:
 
 
 def _batch_delay_seconds() -> float:
-    """Pause between sequential LLM batches, so a run paces itself.
-
-    Six back-to-back batches spend a whole minute's token allowance in a few
-    seconds and then sit through the 429 backoff anyway; a small fixed gap is
-    cheaper than the retries it avoids.
-    """
+    # Fixed gap between batches is cheaper than the 429 retries a burst causes.
     raw = os.getenv("LLM_BATCH_DELAY_SECONDS", "").strip()
     if not raw:
         return DEFAULT_BATCH_DELAY_SECONDS
@@ -231,19 +225,12 @@ def _key_for(provider: str) -> str:
 
 
 def _model_name(provider: str) -> str:
-    """The model this provider would actually call, defaults included."""
     env_name, default = _MODEL_ENV.get(provider, ("", ""))
     return os.getenv(env_name, default).strip() or default if env_name else ""
 
 
 def run_config(diagnoses: list[Diagnosis]) -> dict:
-    """Provenance to travel with anything computed from these diagnoses.
-
-    Every headline number here is downstream of the diagnosis layer, so a run
-    with the provider off still produces real-looking figures that mean
-    something entirely different. Reporting the provider next to the numbers
-    is the only thing that stops the two being confused.
-    """
+    """Provider/model mix that produced these diagnoses — travels with the numbers."""
     provider = _provider_name()
     unknown = sum(diagnosis.cause is RootCause.UNKNOWN for diagnosis in diagnoses)
     # A fallback still carries the method of the layer that failed it, which
@@ -264,12 +251,7 @@ def run_config(diagnoses: list[Diagnosis]) -> dict:
 
 
 def _note_error(exc: BaseException) -> str:
-    """Record a provider failure and surface it immediately.
-
-    Accumulating these in stats alone means a degraded run is only visible to
-    whoever reads the returned dict. Logging at the point of failure puts the
-    specific error in front of the operator while the run is happening.
-    """
+    """Log the provider failure now; stats alone only show up after the run."""
     global _last_error
     detail = f"{type(exc).__name__}: {exc}"
     _last_error = detail
@@ -283,13 +265,8 @@ class LlmProvider(Protocol):
 
 
 class OutageReport:
-    """Result of one fleet pass over a set of failures.
-
-    ``correlation_possible`` is True when at least one sliding window held
-    enough correlatable technical failures to run the concentration test.
-    False means the layer had nothing to work with — a single live event, or
-    sixty dripped across four hours — and callers must say so in evidence
-    rather than silently omitting the layer.
+    """Fleet pass result. ``correlation_possible`` False means nothing to work with
+    (too few events / too sparse) — callers must say so, not treat empty as "no outages".
     """
 
     __slots__ = ("outages", "correlation_possible", "window_minutes", "min_events")
@@ -319,14 +296,7 @@ def _issuer_elevated(
     window_events: list[FailureEvent],
     elevation_factor: float,
 ) -> bool:
-    """Whether this issuer's in-window mix is above its own recent baseline.
-
-    Among the issuer's failures in the window, the technical share is compared
-    to the mean of ``issuer_recent_failure_rate`` on those same events. The
-    batch only contains failures, so this is a mix shift, not a volume rate —
-    exactly the signal that separates "bank is 35% of traffic" from "bank is
-    suddenly all timeouts."
-    """
+    # Mix shift vs the issuer's own recent baseline — not a volume rate.
     theirs = [event for event in window_events if event.issuer == issuer]
     if not theirs:
         return False
@@ -343,29 +313,14 @@ def detect_outages(
     concentration: float = OUTAGE_CONCENTRATION,
     elevation_factor: float = OUTAGE_ELEVATION_FACTOR,
 ) -> OutageReport:
-    """Flag issuer outages from a set of failures before per-event diagnosis.
+    """Flag issuer outages before per-event diagnosis.
 
-    A single timeout looks like a customer problem. Only a cluster of
-    technical-flavoured failures on one issuer, across distinct payment_ids,
-    reveals a bank outage. That correlation does not exist until enough
-    events are seen together — a batch, or a live buffer of recent traffic.
-
-    Two gates, both required:
-
-    * Absolute concentration: the dominant issuer owns at least
-      ``concentration`` of the technical failures in the window.
-    * Elevation: that issuer's in-window technical mix is at least
-      ``elevation_factor`` times its own ``issuer_recent_failure_rate``.
-      Concentration alone fires on high-volume banks at their normal rate.
-
-    Scope: only bursts inside ``window_minutes``. Sixty failures dripped
-    evenly over four hours never co-occur in one window and are out of
-    scope — ``correlation_possible`` will be False and the caller must say
-    so, not pretend the layer ran.
-
-    Events whose issuer is missing (``unknown``) or a PSP handle (``psp:…``),
-    and events with ``retries_used > 0`` (re-presentations), are excluded
-    from the correlation input.
+    Both gates required: dominant issuer ≥ ``concentration`` of technical
+    failures in the window, and that issuer's in-window technical mix ≥
+    ``elevation_factor`` × its recent baseline (concentration alone fires on
+    high-volume banks at their normal rate). Bursts outside ``window_minutes``
+    leave ``correlation_possible`` False — callers must not pretend the layer ran.
+    Skips unknown/PSP issuers and ``retries_used > 0`` (see ``_is_correlatable``).
     """
     global _outage_counts
     _outage_counts = {}
@@ -459,7 +414,6 @@ def diagnose_by_rule(
 
 
 def _with_fleet_note(diagnosis: Diagnosis, report: OutageReport) -> Diagnosis:
-    """Attach an explicit skip reason when the fleet layer had nothing to work with."""
     if report.correlation_possible or diagnosis.method == "fleet":
         return diagnosis
     return diagnosis.model_copy(
@@ -594,12 +548,7 @@ _RETRY_AFTER_RE = re.compile(r"try again in\s+(?:(\d+)m)?([\d.]+)(m?s)\b", re.IG
 
 
 def _rate_limit_wait(response: requests.Response) -> float:
-    """Seconds to wait before retrying a 429.
-
-    Prefers the standard Retry-After header and falls back to the delay named
-    in the error body, since Groq sets both. An unparseable body gets a fixed
-    delay rather than a retry storm.
-    """
+    # Prefer Retry-After; unparseable body → fixed delay (avoid retry storm).
     header = response.headers.get("retry-after", "")
     try:
         return float(header)
@@ -862,12 +811,7 @@ PROVIDERS: dict[str, LlmProvider] = {
 
 
 def _call_llm(events: list[FailureEvent]) -> tuple[list[_LlmItem] | None, str]:
-    """Call the provider and report why it failed, if it did.
-
-    The reason travels with the result so the fallback can put the actual
-    error on the event instead of a category name; every provider path already
-    routes its exception through :func:`_note_error`.
-    """
+    """Provider call; concrete failure reason (via ``_note_error``) for the fallback."""
     global _last_error
     _last_error = None
     name = _provider_name()
@@ -977,11 +921,8 @@ def diagnose_batch(
     events: list[FailureEvent],
     correlation_events: list[FailureEvent] | None = None,
 ) -> tuple[list[Diagnosis], dict]:
-    """Diagnose ``events``, correlating outages over ``correlation_events``.
-
-    ``correlation_events`` defaults to ``events``. The live path passes a
-    rolling buffer of recent traffic so a single webhook is not correlated
-    against itself alone — ``min_events`` is 8 and one event can never trip it.
+    """Diagnose ``events``. Live path passes a rolling buffer as ``correlation_events``
+    so one webhook is not correlated alone (``min_events`` is 8).
     """
     global _cache
     _cache = {}

@@ -22,10 +22,8 @@ MISSING_TIP = "missing_tip"
 
 
 class VerifyResult(NamedTuple):
-    """``failure`` is None when ok.
-
-    ``seq`` points at the row that failed for :data:`TAMPERED`, and at the
-    sequence number the chain should have reached for :data:`TRUNCATED`.
+    """``failure`` is None when ok. ``seq`` is the bad row for TAMPERED, or the
+    expected tip seq for TRUNCATED.
     """
 
     ok: bool

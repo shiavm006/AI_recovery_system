@@ -1,4 +1,4 @@
-"""Constrained allocation of scarce NPCI attempts and contacts. No LLM, no network.
+"""Scarce attempt/contact allocation. No LLM, no network.
 
 SINGLE-EVENT CALLS ARE DEGENERATE: one candidate cannot be ranked. Admission
 only means something if remaining budget persists across calls — webhook.py
@@ -74,10 +74,10 @@ CONTACT_COST_UNITS = 0.25
 # least 24 hours before a re-presentation, so anything sooner would be blocked
 # at the gate anyway.
 ACTION_DELAY_HOURS: dict[RootCause, int] = {
-    RootCause.NETWORK_TIMEOUT: 1,  # retry once the blip clears
-    RootCause.ISSUER_DOWNTIME: 6,  # let the bank's outage window pass
-    RootCause.INSUFFICIENT_FUNDS: 24,  # give the payday credit time to land
-    RootCause.DEAD_MANDATE: 48,  # 24h notice plus margin
+    RootCause.NETWORK_TIMEOUT: 1,
+    RootCause.ISSUER_DOWNTIME: 6,
+    RootCause.INSUFFICIENT_FUNDS: 24,
+    RootCause.DEAD_MANDATE: 48,  # 24h notice (r02) plus margin
 }
 
 # One best action per cause. HARD_DECLINE and RISK_BLOCK are not worth an
@@ -97,12 +97,10 @@ INTERVENTION_BY_CAUSE: dict[RootCause, ActionType] = {
     RootCause.UNKNOWN: ActionType.SUPPRESS,
 }
 
-# A diagnosis we do not believe is not worth a scarce attempt. diagnose.py
-# emits confidence 0.0 for its deterministic fallback, and that fallback
-# defaults to INSUFFICIENT_FUNDS — the highest-scoring cause here — so without
-# this floor a fabricated diagnosis outranks real work. INVENTED threshold, but
-# the coin flip is the natural line: act only when the diagnosis is more likely
-# right than wrong.
+# Act only when confidence ≥ 0.5. UNKNOWN maps to SUPPRESS and scores 0;
+# this floor still stops low-confidence real causes from taking scarce attempts.
+# INVENTED threshold, but the coin flip is the natural line: act only when the
+# diagnosis is more likely right than wrong.
 MIN_ACTIONABLE_CONFIDENCE = 0.5
 
 SUPPRESSED_FOR_BUDGET = "excluded for budget"
@@ -121,8 +119,6 @@ SUPPRESSED_FOR_NO_WINDOW = "excluded for no permitted window"
 # constraint.
 SCHEDULING_HORIZON_HOURS = 72
 
-# The two scarce pools. Mandate attempts are capped by NPCI; contacts are
-# capped by how often we are willing to bother one customer in a cycle.
 RETRY_POOL = "retry"
 CONTACT_POOL = "contact"
 
@@ -258,7 +254,6 @@ def _schedule_context(event: FailureEvent, when: datetime) -> GateContext:
 def schedule_for(
     event: FailureEvent, diagnosis: Diagnosis, action: ActionType
 ) -> datetime | None:
-    """Earliest acceptable time for this cause, pushed to the first legal window."""
     earliest = event.occurred_at + timedelta(
         hours=ACTION_DELAY_HOURS[diagnosis.cause]
     )
@@ -266,7 +261,6 @@ def schedule_for(
 
 
 def budget_pool(action: ActionType) -> str | None:
-    """Which budget the action draws on, or None when it consumes neither."""
     if action in RAIL_ACTIONS:
         return RETRY_POOL
     if action in CONTACT_ACTIONS:
@@ -286,14 +280,9 @@ def _budget_cost(action: ActionType) -> float:
 
 
 def index_score(event: FailureEvent, diagnosis: Diagnosis) -> tuple[float, dict]:
-    """Expected recovered paise per budget unit consumed, plus a breakdown.
+    """Expected recovered paise per budget unit: confidence × P(recovery) × amount / cost.
 
-    Recovery is only worth what the diagnosis is worth, so every term is
-    weighted by ``diagnosis.confidence``: the expected value is
-    ``P(cause is right) * P(recovery | cause) * amount``. Confidence scales the
-    ranking; ``MIN_ACTIONABLE_CONFIDENCE`` in :func:`allocate` is the hard floor.
-
-    ``breakdown["contributions"]`` sums to the returned score.
+    Confidence scales the ranking; ``MIN_ACTIONABLE_CONFIDENCE`` in allocate is the floor.
     """
     action = intervention_for(event, diagnosis)
     cost = _budget_cost(action)
@@ -357,17 +346,10 @@ def allocate(
     retry_budget: int = DEFAULT_RETRY_BUDGET,
     contact_budget: int = DEFAULT_CONTACT_BUDGET,
 ) -> tuple[list[ProposedAction], dict]:
-    """Rank every event by index score and spend both budgets in one pass.
+    """Rank by index score; each pool cuts independently when its budget is dry.
 
-    Attempts draw on ``retry_budget`` and contacts on ``contact_budget``. An
-    action is granted only while its own pool has room; once that pool is dry
-    the event falls through to SUPPRESS naming the budget that ran out, so the
-    two pools cut at different places in the same ranking.
-
-    A diagnosis below ``MIN_ACTIONABLE_CONFIDENCE`` never reaches either pool:
-    scarce budget is not spent on a guess, however large the amount.
-
-    Returns one ProposedAction per input event, in ranked order.
+    Below ``MIN_ACTIONABLE_CONFIDENCE`` never reaches either pool. One ProposedAction
+    per input event, in ranked order.
     """
     if retry_budget < 0 or contact_budget < 0:
         raise ValueError("budgets must be non-negative")

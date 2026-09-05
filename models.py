@@ -30,11 +30,7 @@ class ActionType(str, Enum):
 
 
 class FailureEvent(BaseModel):
-    """A single payment failure observed from Razorpay or synthetic data.
-
-    ``true_cause`` is only populated in synthetic data and is used for grading;
-    the pipeline must never read it.
-    """
+    """``true_cause`` is synthetic grading only — the pipeline must never read it."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -102,8 +98,6 @@ class GateDecision(BaseModel):
 
 
 class BatchResult(BaseModel):
-    """What one policy did to one batch, and what it recovered."""
-
     model_config = ConfigDict(frozen=True)
 
     policy: Literal["agent", "control"]

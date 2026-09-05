@@ -85,7 +85,6 @@ _banknames: dict[str, str] | None = None
 
 
 def _load_banknames() -> dict[str, str]:
-    """Load the vendored IFSC bank-code → name map. No network."""
     global _banknames
     if _banknames is None:
         _banknames = json.loads(BANKNAMES_PATH.read_text())
@@ -93,12 +92,10 @@ def _load_banknames() -> dict[str, str]:
 
 
 def bank_name(code: str) -> str | None:
-    """Resolve a four-character IFSC bank code to its name, or None if unknown."""
     return _load_banknames().get(code.upper())
 
 
 def _ifsc_from_payment(payment: dict[str, Any]) -> str | None:
-    """Pull a raw IFSC string out of the payment entity, if present."""
     for key in ("ifsc", "bank_ifsc"):
         value = payment.get(key)
         if isinstance(value, str) and value.strip():
@@ -117,11 +114,7 @@ def _ifsc_from_payment(payment: dict[str, Any]) -> str | None:
 
 
 def _resolve_ifsc(raw: str) -> tuple[str, str] | None:
-    """Return (bank_code, bank_name) from an IFSC, or None if the code is unknown.
-
-    Does not raise on an unknown prefix — the caller falls through to the next
-    identity path instead of failing the webhook.
-    """
+    """IFSC → (bank_code, bank_name), or None so the caller can fall through without failing the webhook."""
     code = raw.strip().upper()[:4]
     if len(code) < 4 or not code.isalpha():
         return None
@@ -188,15 +181,10 @@ class LiveRecord(BaseModel):
 
 
 class SeenEvents:
-    """Webhook dedupe keyed by Razorpay's event id, on disk.
+    """Webhook dedupe by Razorpay event id, on disk.
 
-    Razorpay delivers at least once, so the same id can arrive minutes later
-    during a retry or hours later after a redeploy. An in-memory set forgets
-    everything on restart — reprocessing a whole retry burst — and grows
-    without bound in a long-lived process. A table does neither.
-
-    Shares the live ledger's database file: one artifact to ship, and the
-    dedupe record cannot end up on a different disk from the trail it guards.
+At-least-once delivery + in-memory set = lost dedupe on restart or unbounded growth.
+Lives in the live ledger DB file.
     """
 
     def __init__(self, db_path: str) -> None:
@@ -258,35 +246,20 @@ class SeenEvents:
 
 
 def mandate_cycle(event: FailureEvent) -> str:
-    """The mandate cycle this failure falls in.
+    """Mandate cycle for this failure.
 
-    ponytail: the IST calendar month, not the real cycle. NPCI's cap is per
-    mandate cycle, whose boundaries come from the subscription's billing anchor
-    — a mandate charged on the 20th runs the 20th to the 19th, not the 1st to
-    the 31st. The webhook does not carry the anchor. Consequence: a failure
-    either side of a month boundary looks like a fresh cycle when it is not, so
-    the cap can be over-granted once per mandate per month. Upgrade path is to
-    read the anchor from the Subscriptions API and bucket from there.
+ponytail: IST calendar month, not the real cycle. NPCI's cap is per mandate cycle
+whose boundaries need the subscription billing anchor — the webhook does not carry
+it. Cross-month failures can look like a fresh cycle; upgrade when the anchor is available.
     """
     return to_ist(event.occurred_at).strftime("%Y-%m")
 
 
 class LiveBudget:
-    """Durable scarcity for the live path, in the ledger's database file.
+    """Durable scarcity for the live path (same SQLite file as the ledger).
 
-    Without this every webhook is allocated against a full, untouched budget,
-    so ten thousand webhooks produce ten thousand approvals and the constraint
-    the whole policy is built around does not exist outside the batch run.
-
-    Two pieces of state:
-
-    * ``mandate_attempts`` — attempts *this system* has placed, per mandate per
-      cycle. This is the trustworthy source for the NPCI cap. The alternative,
-      ``payment.notes.retries_used``, is a merchant-controlled free-text field,
-      which means the one genuinely binding rule in the gate would be enforced
-      against input the merchant can set to zero.
-    * ``budget_spend`` — one row per unit actually placed, so a rolling window
-      can be counted. Rows, not a counter, because a counter cannot expire.
+Without this every webhook allocates against a full budget. Tracks per-mandate
+attempts this system placed and remaining batch-style retry/contact pools.
     """
 
     def __init__(self, db_path: str) -> None:
@@ -372,13 +345,10 @@ class LiveBudget:
 
 
 class RecentFailures:
-    """Rolling window of live failures for fleet outage correlation.
+    """Rolling window for fleet outage correlation.
 
-    ``diagnose_batch([event])`` can never trip ``min_events=8``, so without a
-    buffer the layer pitched as requiring batch context does not exist in
-    production. Each webhook is correlated against the last
-    ``OUTAGE_WINDOW_MINUTES`` of traffic stored here, in the same SQLite file
-    as the ledger.
+A lone ``diagnose_batch([event])`` cannot trip ``min_events=8``; correlate each
+webhook against the last ``OUTAGE_WINDOW_MINUTES`` of traffic stored here.
     """
 
     def __init__(self, db_path: str) -> None:
@@ -441,12 +411,7 @@ class RecentFailures:
 
 
 def reset_live_state() -> None:
-    """Drop cached handles and the feed. For tests only.
-
-    Does not delete the dedupe, budget, or recent-failure tables: surviving a
-    restart is the point, and a test that wants a clean slate should point
-    LIVE_LEDGER_PATH at a new file.
-    """
+    """Drop cached handles and the feed (tests). Does not wipe durable tables."""
     global _ledger, _seen, _budget, _recent
     _live_feed.clear()
     _ledger = None
@@ -491,12 +456,10 @@ def _recent_failures() -> RecentFailures:
 
 
 def verify_webhook_signature(raw_body: bytes, signature: str, secret: str) -> None:
-    """Verify ``raw_body`` against Razorpay's HMAC.
+    """Verify ``raw_body`` against Razorpay HMAC.
 
-    The SDK's ``verify_webhook_signature`` accepts ``str`` only — passing
-    ``bytes`` raises inside the library. Decoding UTF-8 is equivalent to
-    signing the raw bytes for JSON payloads; what must never happen is
-    ``json.dumps(json.loads(raw_body))``.
+SDK wants ``str``; UTF-8 decode equals signing raw bytes for JSON. Never
+``json.dumps(json.loads(raw_body))``.
     """
     Utility().verify_webhook_signature(raw_body.decode("utf-8"), signature, secret)
 
@@ -529,11 +492,9 @@ def _map_method(raw: str | None, provenance: dict[str, str]) -> str:
 
 
 def _map_issuer(payment: dict[str, Any], provenance: dict[str, str]) -> str:
-    """Resolve issuing-bank identity for outage correlation.
+    """Issuing-bank identity for outage correlation.
 
-    Order: IFSC (vendored bank-code map) → unambiguous bank VPA handle →
-    PSP-tagged VPA handle → unknown. Each path records the raw input in
-    provenance. An unknown IFSC prefix falls through rather than raising.
+Order: IFSC → unambiguous bank VPA → PSP-tagged VPA → unknown. Unknown IFSC falls through.
     """
     prior: str | None = None
     raw_ifsc = _ifsc_from_payment(payment)
@@ -585,11 +546,9 @@ def _map_issuer(payment: dict[str, Any], provenance: dict[str, str]) -> str:
 def failure_event_from_webhook(
     event_type: str, body: dict[str, Any]
 ) -> tuple[FailureEvent, dict[str, str]]:
-    """Map a Razorpay webhook body onto :class:`FailureEvent`.
+    """Map Razorpay webhook → FailureEvent.
 
-    ``true_cause`` is always ``None`` — live traffic has no grader label.
-    Discriminating features absent from the payload carry documented defaults
-  in the returned provenance dict.
+``true_cause`` is always None. Missing features get documented defaults in provenance.
     """
     provenance: dict[str, str] = {"true_cause": "live webhook; no ground-truth label"}
     payload = body.get("payload") or {}

@@ -154,22 +154,9 @@ def simulate_outcomes(
     diagnoses: list[Diagnosis],
     seed: int,
 ) -> dict[str, bool]:
-    """Flip one deterministic coin per event. ``actions`` are the ones the gate approved.
-
-    The simulator is the world, not the agent, so it resolves against
-    ``true_cause`` and only falls back to the diagnosed cause when there is no
-    ground truth. This matters: if outcomes were drawn from what the agent
-    *believed*, a confidently wrong diagnosis would be rewarded exactly as
-    much as a correct one, and the control arm — which diagnoses nothing —
-    could not be simulated at all. Reading the truth here is what makes the
-    two arms comparable; the pipeline itself still never sees it.
-
-    The draw is keyed by event_id rather than by draw order, so an event that
-    recovers under one policy recovers under the other. Both arms face the same
-    world and the difference between them is selection, not luck.
-
-    Anything not acted on — suppressed, or blocked at the gate and therefore
-    absent from ``actions`` — recovers nothing.
+    """Deterministic coin per approved action. Resolves against ``true_cause``
+    (diagnosed cause only when ground truth is absent) so arms are comparable —
+    the pipeline itself never sees truth. Draw keyed by event_id, not order.
     """
     by_event = {diagnosis.event_id: diagnosis for diagnosis in diagnoses}
     acting = {
@@ -217,12 +204,7 @@ def _propose_agent(diagnoses: list[Diagnosis]) -> Propose:
 def _propose_control(
     pending: list[FailureEvent], retry_left: int, _contact_left: int
 ) -> list[ProposedAction]:
-    """Retry the first ``retry_left`` failures in arrival order, suppress the rest.
-
-    No diagnosis and no ranking — that absence is the baseline. It never draws
-    on the contact budget, because a fixed schedule has no reason to prefer a
-    payment link over a retry.
-    """
+    """Arrival-order retries; no diagnosis, no contact budget — that absence is the baseline."""
     actions: list[ProposedAction] = []
     for index, event in enumerate(pending):
         if index < retry_left:
@@ -258,23 +240,11 @@ def _propose_control(
 def _plan_and_gate(
     events: list[FailureEvent], propose: Propose, retry_budget: int, contact_budget: int
 ) -> dict:
-    """Propose, gate, reclaim the budget the gate refused, and propose again.
+    """Propose, gate, reclaim budget the gate refused, re-propose.
 
-    A blocked action places nothing, so it must not consume the budget it was
-    granted — otherwise a run reports spending its whole allowance while the
-    gate quietly discarded part of it, and the events just below the cut are
-    denied an attempt that was never actually used. Each pass returns the
-    refused units to the pool and re-proposes over the events that were held
-    back for budget.
-
-    Both policies get this. It is not an intelligence: a fixed-schedule tool
-    that finds its retry rejected also moves to the next name on its list.
-    Withholding reclamation from the control would let the agent place more
-    attempts than the baseline, and the comparison has to differ only in which
-    events are chosen.
-
-    Terminates because a pass either finalises at least one event or the
-    pending set is unchanged, which breaks the loop.
+    A blocked action places nothing — without reclaim, spend is overstated and
+    events below the cut lose attempts that never ran. Both policies get this
+    so the comparison differs only in selection, not in how many attempts land.
     """
     by_id = {event.event_id: event for event in events}
     final: dict[str, ProposedAction] = {}
@@ -328,7 +298,6 @@ def _write_trace(
     score: float | None,
     allocation_pass: int,
 ) -> None:
-    """Four entries per event, always in the same order, whatever the outcome."""
     ledger.append(
         event.event_id,
         ENTRY_INGESTED,

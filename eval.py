@@ -60,12 +60,7 @@ def bayes_ceiling(
     events: list[FailureEvent],
     key: Callable[[FailureEvent], Hashable] = observable_signature,
 ) -> tuple[float, int]:
-    """Best accuracy any classifier could reach on these inputs, and group count.
-
-    Within a group of identical inputs, the most a classifier can do is answer
-    with the most common true cause and be wrong about the rest. Summing the
-    modal count across groups gives the irreducible ceiling.
-    """
+    """Irreducible accuracy: within identical-input groups, pick the modal true cause."""
     groups: dict[Hashable, Counter] = {}
     for event in events:
         groups.setdefault(key(event), Counter())[event.true_cause] += 1
@@ -139,21 +134,10 @@ def reserve_report(
     batch_recovered_paise: int,
     exposure_paise: int = HISTORY_EXPOSURE_PAISE,
 ) -> dict:
-    """Chain-ladder the dispute triangle and net the batch's recovery against it.
+    """Chain-ladder the dispute triangle; net batch recovery against projected clawbacks.
 
-    Recovering money is not the same as keeping it: a card payment recovered
-    today can be charged back for months afterwards, and the disputes that
-    have not arrived yet are exactly what a reserve model is for.
-
-    ``history`` may contain post-valuation disputes. If it does they are held
-    out of the fit and used to grade the projection, which is a reserve model
-    checked against known truth — normally impossible, and only available here
-    because the future was seeded. Pass an observed-only frame (as production
-    would) and the grading section comes back empty.
-
-    ``batch_recovered_paise`` should be card volume only; chargeback rights are
-    a card-network mechanism.
-    """
+``history`` may hold post-valuation disputes — held out for grading (seeded future).
+Observed-only frames leave grading empty. ``batch_recovered_paise`` must be card-only."""
     disputes = history.copy()
     disputes["cohort_month"] = pd.to_datetime(disputes["cohort_month"])
     disputes["dispute_month"] = pd.to_datetime(disputes["dispute_month"])
@@ -293,12 +277,7 @@ def compare(
     control: BatchResult,
     ultimate_dispute_rate: float | None = None,
 ) -> dict:
-    """Side-by-side, on gross and on net.
-
-    ``ultimate_dispute_rate`` comes from :func:`reserve_report`. Without it the
-    net columns equal the gross ones and say so, rather than quietly implying
-    no chargeback exposure exists.
-    """
+    """Gross and net side-by-side. Without ``ultimate_dispute_rate``, net equals gross and says so."""
     left = _policy_view(agent, ultimate_dispute_rate)
     right = _policy_view(control, ultimate_dispute_rate)
 
@@ -365,17 +344,8 @@ def multi_seed(
     seeds: list[int] | tuple[int, ...] = (42, 43, 44, 45, 46),
     provider: str | None = None,
 ) -> dict:
-    """Rerun both policies on a fresh batch per seed and spread the lift.
-
-    One seed cannot distinguish a policy that works from a batch that happened
-    to suit it.
-
-    ``provider`` overrides NAKAD_LLM_PROVIDER for these runs only. Five seeds
-    is five times the LLM spend of the headline run and will exhaust a free
-    daily quota, so the stability check can be run with the provider off while
-    the headline run keeps it live. The returned ``run_config`` records which,
-    so the two are never read as one number.
-    """
+    """Spread of lift across fresh batches. ``provider`` overrides NAKAD_LLM_PROVIDER for
+these runs only so stability can run with the LLM off while the headline stays live."""
     runs = []
     configs: list[dict] = []
     with _provider_override(provider), tempfile.TemporaryDirectory() as workspace:
